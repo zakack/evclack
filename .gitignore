@@ -1,0 +1,4 @@
+build/
+packaging/
+.claude/
+tests/
