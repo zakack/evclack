@@ -1713,6 +1713,12 @@ main(int argc, char **argv) {
                          "stay silent", refs[i].path);
 
         audio_start(cfg.audio_latency);
+    } else {
+        /* Worth saying out loud. In the daemon this grew out of, disabling
+         * audio still left a working SOCD cleaner; here it leaves a process
+         * that opens every matching keyboard and does nothing at all. */
+        LOG_WARN("'audio.enabled' is false - evclack will watch keyboards "
+                 "and play nothing");
     }
 
     /* handlers for graceful shutdown. */
