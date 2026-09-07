@@ -102,8 +102,19 @@ group). The daemon warns and falls back gracefully without it.
 
 Config is read from `~/.config/evclack/config.yaml` (`$XDG_CONFIG_HOME`
 respected), falling back to the installed default. See the extensively
-commented [`config.yaml`](config.yaml) for the full schema. The short
-version:
+commented [`config.yaml`](config.yaml) for the full schema.
+
+**Edits apply immediately.** The daemon watches the config file and reloads
+itself when you save; `systemctl --user reload evclack` (SIGHUP) does the
+same on demand. Keys, samples, gains, devices and latency can all change on
+a running daemon, and a config that does not parse or is rejected is logged
+and ignored rather than taken — the last good one keeps running. Rebinding a
+key is seamless; changing a sample or the latency rebuilds the output node,
+which costs the clicks in flight. Creating `~/.config/evclack/config.yaml`
+for the *first* time still needs a restart, since until it exists the daemon
+is watching the fallback's directory.
+
+The short version:
 
 ```yaml
 # Omit `devices` (or set it to "auto") to watch every keyboard that has
@@ -164,7 +175,8 @@ options:
                 (default /dev/input; mainly for testing)
 ```
 
-Handy for trying config changes before restarting the service:
+Handy for trying config changes without touching the service (and it picks
+up edits to the file while it runs, same as the service does):
 
 ```sh
 ./build/evclack -c config.yaml
