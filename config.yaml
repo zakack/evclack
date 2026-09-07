@@ -7,7 +7,19 @@
 #
 # Copy this file to ~/.config/evclack/config.yaml and edit it there; the
 # daemon prefers that path over the installed copy in /usr/share.
-# After editing, restart the daemon:
+#
+# Edits apply IMMEDIATELY: the daemon watches this file and reloads itself
+# when you save. `systemctl --user reload evclack` (SIGHUP) does the same on
+# demand. Keys, samples, gains, devices and latency can all be changed on a
+# running daemon.
+#
+# A config that does not parse, or that is rejected (a key bound twice, more
+# than 24 distinct sounds), is reported and IGNORED - the daemon keeps
+# running the last good one rather than dying on a typo.
+#
+# The one change that still needs a restart is creating
+# ~/.config/evclack/config.yaml for the first time: until it exists the
+# daemon is watching the fallback copy's directory instead.
 #   systemctl --user restart evclack
 
 # Keyboards to listen to. OPTIONAL. When omitted (or set to the scalar

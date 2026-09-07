@@ -7,6 +7,7 @@ After=pipewire.service wireplumber.service
 [Service]
 Type=simple
 ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/evclack
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 
@@ -25,6 +26,11 @@ RestartSec=2s
 #
 # Config is read from ~/.config/evclack/config.yaml, falling back to
 # @CMAKE_INSTALL_FULL_DATADIR@/evclack/config.yaml.
+#
+# Editing that file applies immediately - the daemon watches it and reloads
+# itself, and `systemctl --user reload evclack` does the same on demand. A
+# restart is only needed to create the per-user config for the FIRST time,
+# since until it exists the daemon is watching the fallback's directory.
 
 [Install]
 WantedBy=default.target

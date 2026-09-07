@@ -62,8 +62,15 @@ schema: `devices` (optional list of `/dev/input/by-id/*` paths; omitted or
 `auto` means auto-discovery), `keys` (REQUIRED — the bindings, each a bare
 `KEY_*` name or numeric code, or a mapping with a per-key `sample` and/or
 `gain`), and `audio` (`enabled`, the default `sample` and `gain`, and
-`latency`). After editing config, restart via
-`systemctl --user restart evclack`. The `-i DIR` flag overrides the
+`latency`).
+
+CONFIG EDITS APPLY LIVE. The daemon watches the config file's PARENT
+DIRECTORY (`IN_CLOSE_WRITE | IN_MOVED_TO`, basename-filtered) and reloads on
+save; SIGHUP does the same on demand, and the unit carries an `ExecReload`
+so `systemctl --user reload evclack` works. Keys, samples, gains, devices
+and latency all change on a running daemon. A restart is needed only to
+create `~/.config/evclack/config.yaml` for the FIRST time, since until it
+exists the watch is on the fallback's directory. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
 testing against a directory of symlinks to synthetic uinput nodes.
 
@@ -91,6 +98,14 @@ sample files that do not exist. Case F is the load-bearing one — it POISONS
 the table with zeros first, because `.bss` zeros read as "every key plays
 sample 0" and a spot check on the bound key alone would pass. Cases G–I are
 the rejections (duplicate key, over-`AUDIO_NSAMPLES`, missing/empty `keys`).
+K–M cover the reload layer: K pins `refs_same_set` as order-independent and
+permutation-producing, L pins that a REJECTED reload leaves `g_key_sample`
+and `g_refs` byte-identical, and M runs three reorder-only reloads in a row
+to catch a `reload_commit` that writes `g_refs` in plan order instead of
+through `map` — a bug that is invisible after only one. M stands up
+`audio_available` and a couple of non-NULL sample pointers by hand, since the
+fast path only engages when audio is up; those buffers are never
+dereferenced.
 
 Both build as part of `all`, deliberately: they `#include evclack.c`, and
 that guarantee is worthless if the binaries can go stale.
@@ -145,7 +160,8 @@ Everything is in `evclack.c`, organized into clearly delimited sections
 5. **Event loop** (`run_loop`/`drain_device`) — a single-threaded
    `epoll`-based loop multiplexes all open devices, an inotify fd watching
    the input dir (and its `by-id`/`by-path` subdirs) with
-   `IN_CREATE | IN_ATTRIB | IN_MOVED_TO`, and the audio wake eventfd.
+   `IN_CREATE | IN_ATTRIB | IN_MOVED_TO`, the audio wake eventfd, a SECOND
+   inotify fd watching the config file, and a signal eventfd.
    `IN_ATTRIB` matters because a hotplugged node is typically root-only
    until udev applies the input-group permissions, so the first open gets
    `EACCES` and the chmod retriggers the reconcile pass. Devices are drained
@@ -154,6 +170,16 @@ Everything is in `evclack.c`, organized into clearly delimited sections
    set on error/HUP without killing the daemon, and the loop keeps running
    with zero devices, waiting for hotplug (it only aborts at startup if
    nothing opened AND inotify is unavailable).
+
+6. **Config reload** (`config_validate` → `reload_commit` → `config_reload`)
+   — the config watch or a SIGHUP sets one flag, consumed once per epoll
+   wake. `config_validate` re-parses and re-plans into a `reload_plan_t`
+   WITHOUT touching a live byte, and decides how much has to move
+   (`RELOAD_NONE` / `LATENCY` / `SAMPLES` / `AUDIO_OFF` / `AUDIO_ON`).
+   `config_reload` then decodes into scratch, moves the audio subsystem,
+   calls `reload_commit`, and finally re-filters and re-opens devices via
+   `devices_refilter` + `reconcile_devices`. See the reload invariants
+   below.
 
 `main()` wires these together: parse args → load config → `bindings_plan`
 (so a bad config is rejected before a graph is built) → attempt `SCHED_FIFO`
@@ -229,6 +255,86 @@ reverse order.
   at `audio.sample[]` — refcounts, to buy a case (one file at two volumes)
   that costs exactly one extra decode today.
 
+## Key invariants to preserve in the config-reload path
+
+- FREEING A SAMPLE BUFFER REQUIRES THE STREAM TEARDOWN, and there is no lock
+  that substitutes. `mix_voice_t.samples` BORROWS `audio.sample[i].samples`
+  outright, and `on_process` runs with `PW_STREAM_FLAG_RT_PROCESS` — on
+  PipeWire's DATA thread, which `pw_thread_loop_lock` does NOT cover. Freeing
+  a buffer a click is still playing out of is a use-after-free in the RT
+  callback. `audio_swap_samples` therefore runs `audio_stream_close()` FIRST:
+  after the node is destroyed no callback exists, which is the same guarantee
+  `audio_restart` already leans on when it memsets the voice pool. Verified
+  under `-fsanitize=address` and `-fsanitize=thread`: 56 reloads that each
+  free and re-decode the set, against a synthetic board at 124 presses/sec
+  into a 259ms sample (~32 voices live throughout), reported nothing.
+
+- `audio_stream_reopen` IS THE ONE PLACE THE RESTART FLAG IS CLEARED. It was
+  split out of `audio_restart` so the reload path reuses it rather than
+  copying its tail — the flag-after-teardown rule it carries is the one
+  documented cause of an infinite rebuild loop, and it must not exist twice.
+  Every caller runs `audio_stream_close()` immediately before it.
+
+- VALIDATE INTO SCRATCH, COMMIT ONLY ON SUCCESS. `config_validate` parses and
+  plans into a `reload_plan_t` and writes NOTHING live; `bindings_plan`
+  returns `-1` partway through on a duplicate key, so pointing it at
+  `g_key_sample` directly would leave a half-written table behind on a
+  rejected config. Decoding likewise happens into a scratch
+  `audio_sample_t[]` BEFORE the teardown, so a missing sample file costs no
+  stream. `maptest` case L pins it, and that case only means anything because
+  `config_validate` is the real function the reload path calls.
+
+- `g_refs` IS INDEXED BY LOADED SAMPLE ID, NOT BY PLAN ORDER, so
+  `reload_commit` writes it THROUGH `map` (`g_refs[map[i]] = p->refs[i]`) and
+  never with a straight copy. On the fast path the key table is remapped onto
+  the buffers already loaded, so a plan-order commit leaves `g_refs[id]`
+  describing a buffer sitting at some other index. Nothing breaks on THAT
+  reload; the NEXT one builds its compare against the mis-indexed set and
+  keys start playing the wrong sample, silently. `maptest` case M runs three
+  reorder-only reloads in a row precisely because one is not enough to see it.
+
+- `g_refs[].path` BORROWS THE LIVE CONFIG'S STRINGS. The compare must run
+  before the old config is freed, and `reload_commit` hands `p->cfg` over to
+  BECOME the live config rather than freeing it. Do not `config_free` a plan
+  that has been committed.
+
+- THE FAST PATH NEEDS FOUR CONDITIONS, not one: the ref set unchanged AND the
+  latency unchanged AND `audio_available == cfg.audio_enabled` AND every
+  committed ref actually loaded. The last two are not paranoia — without them,
+  saving an unchanged config to retry a PipeWire that was down, or to pick up
+  a sample file that has since appeared, takes the no-op path and does
+  nothing at all.
+
+- `reconcile_devices` ONLY OPENS; `devices_refilter` IS WHAT CLOSES. A reload
+  must run both, refilter first. In auto mode the discovery predicate is
+  DERIVED FROM THE BINDINGS, so adding one exotic key narrows which boards
+  qualify, and an already-open board would otherwise keep sounding keys the
+  new config never mentions. The drop is logged with the offending key name
+  (`auto_missing_key`), because this is the "adding a binding silently
+  narrows discovery" consequence biting live, and with no reason given it
+  reads as a bug.
+
+- THE CONFIG WATCH IS ON THE PARENT DIRECTORY, never on the file. Editors and
+  dotfile managers save by writing a temp file and renaming over the target,
+  which replaces the inode — a watch on the file follows the old one and never
+  fires again. `IN_CLOSE_WRITE | IN_MOVED_TO`, and deliberately NOT
+  `IN_MODIFY`: both fire only once the file is COMPLETE, which is what removes
+  the need for a debounce timer.
+
+- SIGHUP GOES THROUGH AN EVENTFD, not a bare flag. A `volatile sig_atomic_t`
+  checked at the top of the loop races with the `epoll_wait` it precedes: a
+  signal landing in that window is not acted on until the next key event, so
+  a reload on an idle daemon appears not to have happened. `write()` is
+  async-signal-safe, and the eventfd-behind-an-epoll-tag pattern is already
+  how the audio thread wakes this loop.
+
+- RELOADING DECODES ON THE EPOLL THREAD, AT `SCHED_FIFO` 90.
+  `SRC_SINC_BEST_QUALITY` is tens of milliseconds per sample, so a reload that
+  changes the sample set drops the keypresses landing during it and can xrun
+  the graph. Bounded, and user-triggered; the alternative is decoding in RT,
+  which is not an alternative. Worth knowing before anything else is added to
+  the reload path.
+
 ## Key invariants to preserve when editing the audio mixer
 
 - THE TRIGGER RING IS THE ONLY STATE SHARED BETWEEN THREADS. Not "the main
@@ -268,9 +374,10 @@ reverse order.
   rejected float32 and `WAVE_FORMAT_EXTENSIBLE` (what ffmpeg and Audacity
   emit above 16-bit or 2 channels) and could not open an `.ogg` or `.mp3` at
   all. Verified bit-identical to that reader on the shipped `click.wav`.
-- THE SUBSYSTEM IS ONE REGION WITH FIVE ENTRY POINTS: `audio_load`,
+- THE SUBSYSTEM IS ONE REGION WITH A SMALL ENTRY SET: `audio_load`,
   `audio_start`, `audio_trigger`, `audio_mix`, `audio_cleanup` (plus
-  `audio_wake_fd`/`audio_restart` for the epoll loop). Sample loading used to
+  `audio_wake_fd`/`audio_restart` for the epoll loop, and
+  `audio_load_into`/`audio_swap_samples`/`audio_relatency` for reload). Sample loading used to
   sit inline in `main()`, outside the banners. It does not any more, and what
   is left in `main()` is only what a DIFFERENT program would write
   differently: which sample id each distinct sound got, and where its path
@@ -307,10 +414,16 @@ reverse order.
   surfaces as `UNCONNECTED`, which no amount of `pw_stream_set_active`
   revives. Both route to the same destroy-and-rebuild, and the loaded samples
   survive it — only `audio_stream_close` runs, not `audio_cleanup`.
-- STARTUP-FAILURE RETRY IS DELIBERATELY ABSENT. There is no stream to raise a
-  callback when `audio_start` fails, so recovering it needs a timerfd in the
-  epoll loop — a second mechanism for a case a `systemctl --user restart`
-  fixes. `audio_start` warns and the daemon runs silently, as it always did.
+- AUTOMATIC STARTUP-FAILURE RETRY IS DELIBERATELY ABSENT. There is no stream
+  to raise a callback when `audio_start` fails, so recovering it ON A TIMER
+  needs a timerfd in the epoll loop — a second mechanism for a case the user
+  can already fix. `audio_start` warns and the daemon runs silently.
+  A CONFIG RELOAD IS THE EXCEPTION, and is the intended recovery: if PipeWire
+  was down at startup, `config_validate` sees `audio_available == 0` against
+  an `enabled` config and returns `RELOAD_AUDIO_ON`, which runs the full
+  `audio_start` path and registers the NEW wake eventfd with epoll (`run_loop`
+  only does that once). User-triggered, not a timer, so the reason the
+  timerfd was rejected still holds.
 - `audio.latency` IS CONFIG, NOT A CONSTANT, and the reason is that its cost
   is not local: PipeWire runs the whole graph at the minimum latency any node
   requests, so this daemon holds the entire session at whatever is set for as

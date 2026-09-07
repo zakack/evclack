@@ -61,6 +61,33 @@ static int load_yaml(const char *yaml, evclack_config_t *cfg) {
     return rc;
 }
 
+/* Write `yaml` to a temp file and leave it there; the caller unlinks. The
+ * reload cases need a path that outlives the write, since config_validate
+ * opens it itself. */
+static void write_yaml(const char *yaml, char *path, size_t n) {
+    snprintf(path, n, "/tmp/evclack-maptest-rl-XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) { perror("mkstemp"); exit(2); }
+    if (write(fd, yaml, strlen(yaml)) != (ssize_t)strlen(yaml)) {
+        perror("write"); exit(2);
+    }
+    close(fd);
+}
+
+/* Validate + commit one config, the way config_reload does minus the device
+ * and audio work. Returns config_validate's verdict. */
+static int reload(const char *yaml, evclack_config_t *live, unsigned *action) {
+    char path[64];
+    reload_plan_t p;
+    write_yaml(yaml, path, sizeof path);
+    int rc = config_validate(path, &p);
+    unlink(path);
+    if (rc != 0) return rc;
+    if (action) *action = p.action;
+    reload_commit(&p, live);
+    return 0;
+}
+
 /* Count table entries that are not -1, so "everything else is unbound" is a
  * property rather than a spot check. */
 static int bound_keys(const int16_t *t) {
@@ -236,6 +263,139 @@ int main(void) {
         expect_str("default sample", cfg.bind[0].sample, DEF_WAV);
         expect_f("default gain", cfg.bind[0].gain, 1.0f);
         config_free(&cfg);
+    }
+
+    puts("K. refs_same_set is order-independent and yields a permutation");
+    {
+        sample_ref_t a[3] = { {"/s/a.wav", 1.0f},
+                              {"/s/b.wav", 1.0f},
+                              {"/s/c.wav", 0.5f} };
+        sample_ref_t b[3] = { {"/s/c.wav", 0.5f},
+                              {"/s/a.wav", 1.0f},
+                              {"/s/b.wav", 1.0f} };
+        int map[AUDIO_NSAMPLES];
+
+        expect_int("reordered set matches", refs_same_set(a, 3, b, 3, map), 1);
+        expect_int("map[0] -> c", map[0], 2);
+        expect_int("map[1] -> a", map[1], 0);
+        expect_int("map[2] -> b", map[2], 1);
+
+        /* Same file, different gain, is a DIFFERENT sound - the interning
+         * rule is on the pair, so the compare has to be too. */
+        sample_ref_t c[3] = { {"/s/a.wav", 1.0f},
+                              {"/s/b.wav", 1.0f},
+                              {"/s/c.wav", 0.9f} };
+        expect_int("a changed gain does not match",
+                   refs_same_set(a, 3, c, 3, map), 0);
+
+        sample_ref_t d[2] = { {"/s/a.wav", 1.0f}, {"/s/b.wav", 1.0f} };
+        expect_int("a smaller set does not match",
+                   refs_same_set(a, 3, d, 2, map), 0);
+    }
+
+    puts("L. a rejected reload changes nothing that is live");
+    {
+        evclack_config_t live;
+        config_init(&live);
+        expect_int("a good config commits",
+                   reload("audio: {sample: /s/a.wav}\n"
+                          "keys: [KEY_Z, KEY_X]\n", &live, NULL), 0);
+
+        int16_t      snap_table[KEY_CNT];
+        sample_ref_t snap_refs[AUDIO_NSAMPLES];
+        int          snap_n = g_n_refs;
+        memcpy(snap_table, g_key_sample, sizeof snap_table);
+        memcpy(snap_refs,  g_refs,       sizeof snap_refs);
+        expect_int("committed 2 keys", bound_keys(g_key_sample), 2);
+
+        /* Not a config at all. */
+        expect_int("broken YAML is rejected",
+                   reload("keys: [KEY_Z\n  - oops\n", &live, NULL), -1);
+        expect_int("  table untouched",
+                   memcmp(snap_table, g_key_sample, sizeof snap_table), 0);
+        expect_int("  refs untouched",
+                   memcmp(snap_refs, g_refs, sizeof snap_refs), 0);
+
+        /* Parses, but bindings_plan rejects it - the case that would
+         * otherwise leave a half-written table behind. */
+        expect_int("duplicate key is rejected",
+                   reload("audio: {sample: /s/a.wav}\n"
+                          "keys: [KEY_Z, KEY_Z]\n", &live, NULL), -1);
+        expect_int("  table untouched",
+                   memcmp(snap_table, g_key_sample, sizeof snap_table), 0);
+        expect_int("  refs untouched",
+                   memcmp(snap_refs, g_refs, sizeof snap_refs), 0);
+        expect_int("  ref count untouched", g_n_refs, snap_n);
+
+        config_free(&live);
+    }
+
+    puts("M. reordering keys re-indexes without moving a loaded sample");
+    {
+        /* The fast path only engages when audio is up and every committed
+         * sample loaded, so stand that state up by hand: no PipeWire here,
+         * and the buffers are never dereferenced - config_validate only asks
+         * whether they are NULL. */
+        evclack_config_t live;
+        config_init(&live);
+        memset(g_refs, 0, sizeof g_refs);
+        g_n_refs = 0;
+        audio_available = 0;
+
+        unsigned action = 0;
+        expect_int("initial load",
+                   reload("audio: {latency: 256}\n"
+                          "keys:\n"
+                          "  - {key: KEY_Z, sample: /s/a.wav}\n"
+                          "  - {key: KEY_X, sample: /s/b.wav}\n",
+                          &live, &action), 0);
+        expect_int("  audio was down, so it is a full start",
+                   (long long)action, RELOAD_AUDIO_ON);
+
+        float dummy[2] = { 0.0f, 0.0f };
+        audio.sample[0].samples = dummy;
+        audio.sample[1].samples = dummy;
+        audio.latency   = 256;
+        audio_available = 1;
+
+        /* Two reloads that only reorder the file. The second is the one that
+         * matters: a commit that wrote g_refs in plan order instead of
+         * through map looks fine after the first and silently swaps the two
+         * samples on the next compare. */
+        const char *swapped =
+            "audio: {latency: 256}\n"
+            "keys:\n"
+            "  - {key: KEY_X, sample: /s/b.wav}\n"
+            "  - {key: KEY_Z, sample: /s/a.wav}\n";
+        const char *original =
+            "audio: {latency: 256}\n"
+            "keys:\n"
+            "  - {key: KEY_Z, sample: /s/a.wav}\n"
+            "  - {key: KEY_X, sample: /s/b.wav}\n";
+
+        for (int pass = 0; pass < 3; pass++) {
+            const char *yaml = (pass % 2 == 0) ? swapped : original;
+            expect_int("reorder-only reload", reload(yaml, &live, &action), 0);
+            expect_int("  nothing to rebuild", (long long)action, RELOAD_NONE);
+            expect_str("  KEY_Z still plays a.wav",
+                       g_refs[g_key_sample[KEY_Z]].path, "/s/a.wav");
+            expect_str("  KEY_X still plays b.wav",
+                       g_refs[g_key_sample[KEY_X]].path, "/s/b.wav");
+        }
+
+        /* A changed gain is a different sound, so the samples must move. */
+        expect_int("changing a gain forces a re-decode",
+                   reload("audio: {latency: 256}\n"
+                          "keys:\n"
+                          "  - {key: KEY_Z, sample: /s/a.wav, gain: 0.5}\n"
+                          "  - {key: KEY_X, sample: /s/b.wav}\n",
+                          &live, &action), 0);
+        expect_int("  action", (long long)action, RELOAD_SAMPLES);
+
+        audio.sample[0].samples = NULL;
+        audio.sample[1].samples = NULL;
+        audio_available = 0;
+        config_free(&live);
     }
 
     if (failures) {

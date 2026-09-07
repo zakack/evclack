@@ -104,10 +104,27 @@ static void logf_(const char *level, const char *fmt, ...) {
 /* ------------------------------------------------------------------------- */
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_reload;
+
+/* Written by the handler to wake epoll_wait. A bare flag checked at the top
+ * of the loop is not enough: a SIGHUP landing between the check and the
+ * epoll_wait it precedes is not delivered until the NEXT event, so a reload
+ * on an idle daemon would appear not to have happened until the user pressed
+ * a key. write() is async-signal-safe, and an eventfd behind an epoll tag is
+ * already how the audio thread wakes this loop. */
+static int g_sigfd = -1;
 
 static void on_signal(int sig) {
-    (void)sig;
-    g_running = 0;
+    if (sig == SIGHUP)
+        g_reload = 1;
+    else
+        g_running = 0;
+
+    if (g_sigfd >= 0) {
+        uint64_t one = 1;
+        ssize_t  n = write(g_sigfd, &one, sizeof(one));
+        (void)n;   /* EAGAIN here means the counter is already raised */
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -339,19 +356,28 @@ static int sample_conform(const float *in, size_t frames, int ch, int rate,
  * What stays the caller's business is which sample id means what and where
  * the paths and gains came from, which is exactly the part that differs
  * between one program and the next. */
-static int audio_load(int idx, const char *path, float gain) {
-    if (idx < 0 || idx >= AUDIO_NSAMPLES || !path) return -1;
+static int audio_load_into(audio_sample_t *dst, const char *path, float gain) {
+    if (!dst || !path) return -1;
 
     size_t frames; int ch, rate;
     float *raw = sample_decode(path, &frames, &ch, &rate);
     if (!raw) return -1;
 
-    int rc = sample_conform(raw, frames, ch, rate, &audio.sample[idx]);
+    int rc = sample_conform(raw, frames, ch, rate, dst);
     free(raw);
     if (rc != 0) return -1;
 
-    audio.sample[idx].gain = gain;
+    dst->gain = gain;
     return 0;
+}
+
+/* The startup form: load straight into the live table. A config reload goes
+ * through audio_load_into with a scratch slot instead, because decoding has
+ * to finish BEFORE the old buffers can be freed - the RT thread is still
+ * playing out of them. */
+static int audio_load(int idx, const char *path, float gain) {
+    if (idx < 0 || idx >= AUDIO_NSAMPLES) return -1;
+    return audio_load_into(&audio.sample[idx], path, gain);
 }
 
 /* Take a voice for `s`. RT side, called only from the ring drain.
@@ -726,12 +752,15 @@ static void audio_cleanup(void);
  * Voices in flight are lost with the old node. That is correct: they are
  * clicks, and the alternative is carrying a voice pool across a graph whose
  * rate we are about to renegotiate. */
-static void audio_restart(void) {
-    if (!audio_available) return;
-    if (!atomic_load(&audio.restart)) return;
-
-    audio_stream_close();
-
+/* The second half of every rebuild: bring the node back up around whatever
+ * audio.sample[] and audio.latency now hold. Split out of audio_restart so
+ * the config-reload path reuses it verbatim rather than copying its tail -
+ * the "clear the flag after the teardown" rule below is the one thing in
+ * this file that causes an INFINITE rebuild loop when got wrong, and it is
+ * worth a great deal that it exists in exactly one place.
+ *
+ * Every caller must have run audio_stream_close() first. */
+static void audio_stream_reopen(void) {
     /* Clear the flag AFTER the teardown, never before. pw_stream_destroy
      * emits a final state_changed on its way out whenever the stream was not
      * already UNCONNECTED - which is precisely the ERROR case - and that
@@ -765,11 +794,64 @@ static void audio_restart(void) {
     LOG_INFO("Audio stream rebuilt");
 }
 
+static void audio_restart(void) {
+    if (!audio_available) return;
+    if (!atomic_load(&audio.restart)) return;
+
+    audio_stream_close();
+    audio_stream_reopen();
+}
+
+/* Replace the whole loaded sample set. THE reason a config reload is not
+ * just "re-read the file": mix_voice_t.samples borrows audio.sample[i]
+ * outright, and on_process runs with PW_STREAM_FLAG_RT_PROCESS - on
+ * PipeWire's DATA thread, which pw_thread_loop_lock does not cover. There is
+ * no lock that makes freeing one of these buffers safe against a click that
+ * is still playing out of it. The stream teardown is the synchronisation:
+ * after audio_stream_close() the node is destroyed and no callback exists,
+ * which is the same guarantee audio_restart already leans on when it memsets
+ * the voice pool.
+ *
+ * Takes ownership of the buffers in `newset` and nulls what it took, so a
+ * caller can free the remainder unconditionally. */
+static int audio_swap_samples(audio_sample_t *newset, int n_new,
+                              unsigned latency) {
+    if (!audio_available) return -1;
+
+    audio_stream_close();
+
+    for (int i = 0; i < AUDIO_NSAMPLES; i++) {
+        free(audio.sample[i].samples);
+        audio.sample[i].samples    = NULL;
+        audio.sample[i].num_frames = 0;
+        audio.sample[i].gain       = 0.0f;
+    }
+    for (int i = 0; i < n_new && i < AUDIO_NSAMPLES; i++) {
+        audio.sample[i]    = newset[i];
+        newset[i].samples  = NULL;
+    }
+    audio.latency = latency ? latency : AUDIO_LATENCY_DEFAULT;
+
+    audio_stream_reopen();
+    return audio_available ? 0 : -1;
+}
+
+/* Renegotiate the node quantum, keeping every loaded sample. Latency is the
+ * one audio setting that costs a stream rebuild but no decoding, and
+ * SRC_SINC_BEST_QUALITY is tens of milliseconds per sample on an epoll
+ * thread running at SCHED_FIFO - worth not paying for nothing. */
+static void audio_relatency(unsigned latency) {
+    if (!audio_available) return;
+    audio_stream_close();
+    audio.latency = latency ? latency : AUDIO_LATENCY_DEFAULT;
+    audio_stream_reopen();
+}
+
 static void audio_cleanup(void) {
     if (!audio_available) return;
     audio_stream_close();
     if (audio.wakefd >= 0) { close(audio.wakefd); audio.wakefd = -1; }
-    unsigned dropped = atomic_load(&trig.overruns);
+    unsigned dropped = atomic_exchange(&trig.overruns, 0);
     if (dropped)
         LOG_WARN("%u hitsound trigger(s) dropped on a full ring", dropped);
     for (int i = 0; i < AUDIO_NSAMPLES; i++) {
@@ -1162,6 +1244,16 @@ typedef struct {
  * exact inverse of what the config says. */
 static int16_t g_key_sample[KEY_CNT];
 
+/* The sample set g_key_sample's ids refer to, indexed by LOADED SAMPLE ID -
+ * the same index as audio.sample[]. Kept so a reload can ask "is this the
+ * same set of sounds?" without re-decoding anything.
+ *
+ * The paths are BORROWED from the live config's bind[].sample, so the config
+ * these were planned from must outlive them: a reload compares before it
+ * frees, and re-points these into the new config as part of the commit. */
+static sample_ref_t g_refs[AUDIO_NSAMPLES];
+static int          g_n_refs;
+
 /* Resolve the bindings into the key table and the distinct samples they
  * need. No I/O: loading is the caller's job, which is what lets this be
  * tested without a file on disk. Returns 0, or -1 with a message. */
@@ -1203,6 +1295,111 @@ static int bindings_plan(const evclack_config_t *cfg, int16_t *key_sample,
     return 0;
 }
 
+/* Do two planned sets name the same distinct sounds, ignoring the order the
+ * config happened to list them in? On success `map` is filled so that
+ * map[new_id] == old_id, which is what lets a reload re-point the key table
+ * at the buffers ALREADY LOADED instead of decoding them again.
+ *
+ * Order-independence is the whole point: moving one binding up the file must
+ * not cost a stream rebuild. bindings_plan interns, so ids within a set are
+ * dense and distinct and a match therefore makes `map` a permutation - which
+ * the commit relies on. `used` enforces that rather than assuming it. */
+static int refs_same_set(const sample_ref_t *old, int n_old,
+                         const sample_ref_t *nw, int n_new, int *map) {
+    if (n_old != n_new) return 0;
+    if (n_old > AUDIO_NSAMPLES) return 0;
+
+    int used[AUDIO_NSAMPLES] = { 0 };
+    for (int i = 0; i < n_new; i++) {
+        int found = -1;
+        for (int j = 0; j < n_old; j++) {
+            if (used[j]) continue;
+            if (old[j].path && nw[i].path &&
+                strcmp(old[j].path, nw[i].path) == 0 &&
+                old[j].gain == nw[i].gain) { found = j; break; }
+        }
+        if (found < 0) return 0;
+        used[found] = 1;
+        map[i] = found;
+    }
+    return 1;
+}
+
+/* What a reload has to do to the audio subsystem, cheapest first. */
+enum {
+    RELOAD_NONE = 0,   /* key table only - no seam, nothing rebuilt */
+    RELOAD_LATENCY,    /* rebuild the node, keep every loaded sample */
+    RELOAD_SAMPLES,    /* re-decode and swap the sample set */
+    RELOAD_AUDIO_OFF,  /* audio.enabled went false */
+    RELOAD_AUDIO_ON,   /* audio.enabled went true, or startup had failed */
+};
+
+/* A validated, not-yet-committed configuration. */
+typedef struct {
+    evclack_config_t cfg;
+    int16_t          table[KEY_CNT];
+    sample_ref_t     refs[AUDIO_NSAMPLES];
+    int              n_refs;
+    int              map[AUDIO_NSAMPLES];   /* map[new_id] = loaded id */
+    unsigned         action;
+} reload_plan_t;
+
+/* Parse and plan a config WITHOUT touching a single live byte: no device is
+ * opened or closed, no sample is decoded, g_key_sample and g_refs are not
+ * written. Everything that can be rejected is rejected here, so the caller's
+ * commit cannot fail halfway and leave a daemon running half of one config
+ * and half of another.
+ *
+ * That is the same reason bindings_plan does no I/O, and it is what makes
+ * "a bad config changes nothing" a testable claim rather than a hope -
+ * maptest calls this directly. Returns 0 with `out` owning a config the
+ * caller must either commit or config_free. */
+static int config_validate(const char *path, reload_plan_t *out) {
+    memset(out, 0, sizeof(*out));
+    config_init(&out->cfg);
+
+    if (load_config(path, &out->cfg) != 0)
+        return -1;
+    if (bindings_plan(&out->cfg, out->table, out->refs, &out->n_refs) != 0) {
+        config_free(&out->cfg);
+        return -1;
+    }
+
+    /* Identity unless the fast path below earns a real permutation. */
+    for (int i = 0; i < AUDIO_NSAMPLES; i++) out->map[i] = i;
+
+    if (!out->cfg.audio_enabled) {
+        out->action = audio_available ? RELOAD_AUDIO_OFF : RELOAD_NONE;
+        return 0;
+    }
+    /* Audio wanted but not running - either disabled before, or PipeWire was
+     * down when the daemon started. Reload is the retry. */
+    if (!audio_available) {
+        out->action = RELOAD_AUDIO_ON;
+        return 0;
+    }
+
+    /* A committed ref whose file never decoded counts as CHANGED, so putting
+     * the missing sample in place and saving picks it up. Without this, an
+     * otherwise-identical config takes the fast path and the key stays
+     * silent forever. */
+    int all_loaded = 1;
+    for (int i = 0; i < g_n_refs; i++)
+        if (!audio.sample[i].samples) { all_loaded = 0; break; }
+
+    if (!all_loaded ||
+        !refs_same_set(g_refs, g_n_refs, out->refs, out->n_refs, out->map)) {
+        /* refs_same_set may have written part of map before giving up. */
+        for (int i = 0; i < AUDIO_NSAMPLES; i++) out->map[i] = i;
+        out->action = RELOAD_SAMPLES;
+        return 0;
+    }
+
+    out->action = (out->cfg.audio_latency != audio.latency) ? RELOAD_LATENCY
+                                                            : RELOAD_NONE;
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Input devices                                                             */
 /* ------------------------------------------------------------------------- */
@@ -1212,11 +1409,14 @@ static int bindings_plan(const evclack_config_t *cfg, int16_t *key_sample,
  * device from the audio wake eventfd. `kind` must stay the FIRST member of
  * input_dev_t: the dispatch reads the leading int off whatever data.ptr
  * points at. */
-enum { EP_INPUT = 1, EP_AUDIO = 2 };
+enum { EP_INPUT = 1, EP_AUDIO = 2, EP_CONFIG = 3, EP_SIGNAL = 4 };
 
 /* The audio wake eventfd has no struct of its own; the epoll set is keyed
- * on a leading discriminator, so it gets a standing one. */
-static int g_ep_audio = EP_AUDIO;
+ * on a leading discriminator, so it gets a standing one. So do the config
+ * watch and the signal eventfd. */
+static int g_ep_audio  = EP_AUDIO;
+static int g_ep_config = EP_CONFIG;
+static int g_ep_signal = EP_SIGNAL;
 
 typedef struct {
     int               kind;    /* EP_INPUT */
@@ -1273,12 +1473,21 @@ static int dev_list_has_rdev(const dev_list_t *l, dev_t rdev) {
  * most likely to want it. There is no double-fire to avoid either - a
  * grabbed node yields nothing to a passive reader - and evclack emits no
  * events of its own, so it cannot hear itself. */
+/* The first bound key this device cannot report, or -1 if it carries them
+ * all. Split out of auto_open_ok so a reload can SAY which binding
+ * disqualified a board it is dropping. */
+static int auto_missing_key(struct libevdev *dev, const evclack_config_t *cfg) {
+    for (size_t i = 0; i < cfg->n_bind; i++)
+        if (!libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->bind[i].key))
+            return cfg->bind[i].key;
+    return -1;
+}
+
 static int auto_open_ok(struct libevdev *dev, const evclack_config_t *cfg) {
     /* Every bound key, not just some. A board carrying a subset would be
      * opened for keys it cannot report. */
-    for (size_t i = 0; i < cfg->n_bind; i++)
-        if (!libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->bind[i].key))
-            return 0;
+    if (auto_missing_key(dev, cfg) >= 0)
+        return 0;
     if (libevdev_has_event_type(dev, EV_REL) ||
         libevdev_has_event_type(dev, EV_ABS))
         return 0;
@@ -1432,9 +1641,285 @@ static void reconcile_devices(dev_list_t *devs, const evclack_config_t *cfg,
     free(ents);
 }
 
+/* Would this already-open device be opened again under `cfg`? Reads the live
+ * libevdev handle, so it costs no I/O. */
+static int device_keep(const input_dev_t *in, const evclack_config_t *cfg) {
+    if (cfg->auto_discover)
+        return auto_open_ok(in->dev, cfg);
+    for (size_t i = 0; i < cfg->n_devices; i++)
+        if (strcmp(in->path, cfg->device_paths[i]) == 0)
+            return 1;
+    return 0;
+}
+
+/* The half reconcile_devices does not do: CLOSE whatever should no longer be
+ * open. Only a config reload needs it, and it is not optional there - in auto
+ * mode the discovery filter is derived from the bindings, so adding one
+ * exotic key narrows which boards qualify and an already-open board would
+ * otherwise keep sounding keys the new config never mentions. Running this
+ * before the reopen pass also makes an explicit/auto mode switch fall out for
+ * free. */
+static void devices_refilter(dev_list_t *devs, const evclack_config_t *cfg,
+                             int epfd) {
+    for (size_t i = 0; i < devs->n; ) {
+        input_dev_t *in = devs->v[i];
+        if (device_keep(in, cfg)) { i++; continue; }
+
+        /* Say WHY. "Adding a binding silently narrowed auto-discovery" is a
+         * documented consequence of the every-bound-key rule, and with no
+         * line naming the key it reads as the daemon breaking. */
+        if (cfg->auto_discover) {
+            int miss = auto_missing_key(in->dev, cfg);
+            if (miss >= 0)
+                LOG_INFO("Dropping %s: it cannot report %s, and "
+                         "auto-discovery needs every bound key",
+                         in->path, key_name_or(miss));
+            else
+                LOG_INFO("Dropping %s: no longer matches auto-discovery",
+                         in->path);
+        } else {
+            LOG_INFO("Dropping %s: no longer listed in 'devices'", in->path);
+        }
+
+        epoll_ctl(epfd, EPOLL_CTL_DEL, in->fd, NULL);
+        dev_list_remove(devs, in);   /* swaps the tail into slot i */
+        input_close(in);
+        free(in);
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 /* loop                                                                      */
 /* ------------------------------------------------------------------------- */
+
+/* ---- config watch -------------------------------------------------------
+ *
+ * The config's PARENT DIRECTORY is what gets watched, not the file. Editors
+ * and dotfile managers overwhelmingly save by writing a temp file and
+ * renaming it over the target, which replaces the inode - a watch on the file
+ * itself would follow the old one and never fire again.
+ *
+ * IN_CLOSE_WRITE | IN_MOVED_TO, and deliberately NOT IN_MODIFY: both of these
+ * fire only once the file is COMPLETE (the writer closed its fd, or the
+ * rename landed), which is what removes the need for a debounce timer. A
+ * half-written file would just be rejected by config_validate anyway, but
+ * a spurious parse error per keystroke-in-vim is not a good look.
+ *
+ * Up to two (dir, name) pairs are watched: the literal path, and its
+ * realpath() when that differs, so a ~/.config symlinked into a dotfile repo
+ * reloads whether the editor writes through the link or into the repo. */
+typedef struct {
+    char dir[PATH_MAX];
+    char base[NAME_MAX + 1];
+} cfg_watch_t;
+
+static cfg_watch_t g_cfg_watch[2];
+static int         g_n_cfg_watch;
+
+static void cfg_watch_add(const char *path) {
+    if (g_n_cfg_watch >= (int)(sizeof(g_cfg_watch) / sizeof(g_cfg_watch[0])))
+        return;
+
+    cfg_watch_t w;
+    const char *slash = strrchr(path, '/');
+    if (slash) {
+        size_t dlen = (size_t)(slash - path);
+        if (dlen == 0) dlen = 1;                    /* "/foo" -> "/" */
+        if (dlen >= sizeof(w.dir)) return;
+        memcpy(w.dir, path, dlen);
+        w.dir[dlen] = '\0';
+        snprintf(w.base, sizeof(w.base), "%s", slash + 1);
+    } else {
+        snprintf(w.dir,  sizeof(w.dir),  ".");
+        snprintf(w.base, sizeof(w.base), "%s", path);
+    }
+    if (w.base[0] == '\0') return;
+
+    for (int i = 0; i < g_n_cfg_watch; i++)
+        if (strcmp(g_cfg_watch[i].dir,  w.dir)  == 0 &&
+            strcmp(g_cfg_watch[i].base, w.base) == 0)
+            return;
+    g_cfg_watch[g_n_cfg_watch++] = w;
+}
+
+/* Returns the inotify fd, or -1 with a warning. Not fatal: SIGHUP still
+ * reloads, and the daemon still runs. */
+static int config_watch_open(const char *config_path) {
+    char real[PATH_MAX];
+
+    cfg_watch_add(config_path);
+    if (realpath(config_path, real))
+        cfg_watch_add(real);
+
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd < 0) {
+        LOG_WARN("inotify_init1: %s - config auto-reload disabled "
+                 "(SIGHUP still works)", strerror(errno));
+        return -1;
+    }
+
+    int ok = 0;
+    for (int i = 0; i < g_n_cfg_watch; i++) {
+        if (inotify_add_watch(fd, g_cfg_watch[i].dir,
+                              IN_CLOSE_WRITE | IN_MOVED_TO) >= 0)
+            ok = 1;
+        else
+            LOG_WARN("inotify_add_watch(%s): %s", g_cfg_watch[i].dir,
+                     strerror(errno));
+    }
+    if (!ok) {
+        LOG_WARN("Config auto-reload disabled (SIGHUP still works)");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Drain the watch and report whether anything named the config. The
+ * directory carries every other file in it too, so the name filter is what
+ * keeps an unrelated save from rebuilding the audio graph. */
+static int config_watch_hit(int fd) {
+    union {
+        char buf[4096];
+        struct inotify_event align;
+    } u;
+    int hit = 0;
+    ssize_t n;
+
+    while ((n = read(fd, u.buf, sizeof(u.buf))) > 0) {
+        for (char *q = u.buf; q < u.buf + n; ) {
+            const struct inotify_event *e = (const struct inotify_event *)q;
+            if (e->len) {
+                for (int i = 0; i < g_n_cfg_watch; i++)
+                    if (strcmp(e->name, g_cfg_watch[i].base) == 0) {
+                        hit = 1;
+                        break;
+                    }
+            }
+            q += sizeof(*e) + e->len;
+        }
+    }
+    return hit;
+}
+
+/* Install a validated plan: the key table, the committed ref set, and the
+ * config itself. Cannot fail, touches no device and no sample buffer, and
+ * does no I/O - which is what lets maptest run a whole reload SEQUENCE with
+ * no daemon around it. Takes ownership of p->cfg. */
+static void reload_commit(reload_plan_t *p, evclack_config_t *cfg) {
+    /* The plan's ids are in config order; map takes them to where the buffers
+     * actually live. Identity on every path that reloaded the samples. */
+    for (int k = 0; k < KEY_CNT; k++)
+        if (p->table[k] >= 0)
+            p->table[k] = (int16_t)p->map[p->table[k]];
+    memcpy(g_key_sample, p->table, sizeof(g_key_sample));
+
+    /* g_refs is indexed by LOADED SAMPLE ID, so it is written THROUGH map,
+     * not memcpy'd in plan order. Getting this wrong is invisible on this
+     * reload and wrong on the NEXT one: that compare would build its map
+     * against a mis-indexed set and keys would start playing the wrong
+     * sample, with no error anywhere. maptest case M runs two reloads in a
+     * row for exactly this reason. */
+    memset(g_refs, 0, sizeof(g_refs));
+    for (int i = 0; i < p->n_refs; i++)
+        g_refs[p->map[i]] = p->refs[i];
+    g_n_refs = p->n_refs;
+
+    /* g_refs borrows p->cfg's strings, so p->cfg must BECOME the live config
+     * rather than be freed. The pointer the loop holds stays put. */
+    config_free(cfg);
+    *cfg = p->cfg;
+    memset(&p->cfg, 0, sizeof(p->cfg));
+}
+
+/* Apply a new config to the running daemon, or keep the old one entirely.
+ *
+ * Ordering is the whole design. Everything that can be rejected is rejected
+ * by config_validate before a live byte moves; everything that can fail
+ * slowly (decoding) happens into scratch buffers while the old ones are still
+ * playing; and only then does the commit run, which cannot fail. */
+static void config_reload(dev_list_t *devs, evclack_config_t *cfg,
+                          const char *config_path, const char *input_dir,
+                          int epfd) {
+    reload_plan_t p;
+
+    LOG_INFO("Reloading %s", config_path);
+    if (config_validate(config_path, &p) != 0) {
+        LOG_WARN("Reload rejected; keeping the running configuration");
+        return;
+    }
+
+    /* Decode BEFORE anything is torn down. A sample that fails to open then
+     * costs its own keys and nothing else - not the stream, not the reload.
+     * This is also the slow part: SRC_SINC_BEST_QUALITY runs here, on the
+     * epoll thread, at SCHED_FIFO, so keypresses landing during it are lost.
+     * Bounded, user-triggered, and the price of not decoding in RT. */
+    audio_sample_t newset[AUDIO_NSAMPLES];
+    memset(newset, 0, sizeof(newset));
+    if (p.action == RELOAD_SAMPLES || p.action == RELOAD_AUDIO_ON) {
+        for (int i = 0; i < p.n_refs; i++)
+            if (audio_load_into(&newset[i], p.refs[i].path,
+                                p.refs[i].gain) != 0)
+                LOG_WARN("hitsound load failed (%s); the keys bound to it "
+                         "stay silent", p.refs[i].path);
+    }
+
+    switch (p.action) {
+    case RELOAD_AUDIO_OFF:
+        /* Explicit DEL before the fd is closed. Closing removes it from the
+         * set on its own, but a later eventfd reusing the number would then
+         * look registered when it is not. */
+        if (audio_wake_fd() >= 0)
+            epoll_ctl(epfd, EPOLL_CTL_DEL, audio_wake_fd(), NULL);
+        audio_cleanup();
+        LOG_INFO("Audio disabled by config");
+        break;
+
+    case RELOAD_AUDIO_ON:
+        /* audio_available is 0, so audio.sample[] is empty - either it never
+         * started or audio_cleanup emptied it. Nothing to free here. */
+        for (int i = 0; i < p.n_refs && i < AUDIO_NSAMPLES; i++) {
+            audio.sample[i]   = newset[i];
+            newset[i].samples = NULL;
+        }
+        if (audio_start(p.cfg.audio_latency) == 0) {
+            int afd = audio_wake_fd();
+            struct epoll_event ev = { .events = EPOLLIN,
+                                      .data = { .ptr = &g_ep_audio } };
+            if (afd >= 0 && epoll_ctl(epfd, EPOLL_CTL_ADD, afd, &ev) < 0)
+                LOG_WARN("epoll_ctl ADD audio: %s - a lost stream will stay "
+                         "lost", strerror(errno));
+            LOG_INFO("Audio started");
+        }
+        break;
+
+    case RELOAD_SAMPLES:
+        audio_swap_samples(newset, p.n_refs, p.cfg.audio_latency);
+        break;
+
+    case RELOAD_LATENCY:
+        audio_relatency(p.cfg.audio_latency);
+        break;
+
+    default:
+        break;   /* RELOAD_NONE: the key table alone */
+    }
+
+    /* Whatever nobody took ownership of - a failed load, or a whole set the
+     * audio path rejected. Every consumer nulls what it kept. */
+    for (int i = 0; i < AUDIO_NSAMPLES; i++)
+        free(newset[i].samples);
+
+    reload_commit(&p, cfg);
+
+    devices_refilter(devs, cfg, epfd);
+    reconcile_devices(devs, cfg, input_dir, epfd, 1);
+
+    LOG_INFO("Reloaded: %zu key(s) on %d sample(s), audio=%s, %zu device(s) "
+             "open", cfg->n_bind, p.n_refs,
+             cfg->audio_enabled ? (audio_available ? "on" : "failed") : "off",
+             devs->n);
+}
 
 /* drain everything libevdev has buffered, looping over SYNC drops
  * as needed. return 0 on normal EAGAIN, -1 on fatal error.
@@ -1478,8 +1963,8 @@ static int drain_device(input_dev_t *in) {
     return 0;
 }
 
-static int run_loop(dev_list_t *devs, const evclack_config_t *cfg,
-                    const char *input_dir) {
+static int run_loop(dev_list_t *devs, evclack_config_t *cfg,
+                    const char *input_dir, const char *config_path) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
         LOG_ERR("epoll_create1: %s", strerror(errno));
@@ -1520,6 +2005,29 @@ static int run_loop(dev_list_t *devs, const evclack_config_t *cfg,
                      strerror(errno));
     }
 
+    /* Config auto-reload. Losing this costs the watch, not the daemon -
+     * SIGHUP still reloads. */
+    int cfd = config_watch_open(config_path);
+    if (cfd >= 0) {
+        struct epoll_event ev = { .events = EPOLLIN,
+                                  .data = { .ptr = &g_ep_config } };
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+            LOG_WARN("epoll_ctl ADD config watch: %s - auto-reload disabled",
+                     strerror(errno));
+            close(cfd);
+            cfd = -1;
+        }
+    }
+
+    /* SIGHUP, via the handler's eventfd. */
+    if (g_sigfd >= 0) {
+        struct epoll_event ev = { .events = EPOLLIN,
+                                  .data = { .ptr = &g_ep_signal } };
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, g_sigfd, &ev) < 0)
+            LOG_WARN("epoll_ctl ADD signal: %s - SIGHUP will not reload until "
+                     "the next key event", strerror(errno));
+    }
+
     reconcile_devices(devs, cfg, input_dir, epfd, 1);
     if (devs->n == 0) {
         if (ifd < 0) {
@@ -1541,7 +2049,7 @@ static int run_loop(dev_list_t *devs, const evclack_config_t *cfg,
             LOG_ERR("epoll_wait: %s", strerror(errno));
             break;
         }
-        int rescan = 0;
+        int rescan = 0, reload = 0;
         for (int i = 0; i < nfd; i++) {
             if (events[i].data.ptr == NULL) { /* inotify fd */
                 char buf[4096];
@@ -1554,6 +2062,19 @@ static int run_loop(dev_list_t *devs, const evclack_config_t *cfg,
             if (*(int *)events[i].data.ptr == EP_AUDIO) {
                 audio_restart();
                 continue;
+            }
+
+            if (*(int *)events[i].data.ptr == EP_CONFIG) {
+                if (config_watch_hit(cfd))
+                    reload = 1;
+                continue;
+            }
+
+            if (*(int *)events[i].data.ptr == EP_SIGNAL) {
+                uint64_t drain;
+                while (read(g_sigfd, &drain, sizeof(drain)) > 0)
+                    ;
+                continue;   /* g_reload / g_running are read below */
             }
 
 
@@ -1576,7 +2097,14 @@ static int run_loop(dev_list_t *devs, const evclack_config_t *cfg,
                 free(in);
             }
         }
-        if (rescan) {
+        if (g_reload) {
+            g_reload = 0;
+            reload   = 1;
+        }
+        if (reload) {
+            /* Reloading reconciles devices itself, against the NEW config. */
+            config_reload(devs, cfg, config_path, input_dir, epfd);
+        } else if (rescan) {
             reconcile_devices(devs, cfg, input_dir, epfd, 0);
         }
         if (devs->n == 0 && ifd < 0) {
@@ -1586,6 +2114,7 @@ static int run_loop(dev_list_t *devs, const evclack_config_t *cfg,
     }
 
     if (ifd >= 0) close(ifd);
+    if (cfd >= 0) close(cfd);
     close(epfd);
     return 0;
 }
@@ -1674,9 +2203,7 @@ main(int argc, char **argv) {
     /* Resolve the bindings before anything is opened: this is where a
      * duplicate key or an over-full sample table is caught, and there is no
      * point bringing up a graph for a config that cannot run. */
-    sample_ref_t refs[AUDIO_NSAMPLES];
-    int n_refs = 0;
-    if (bindings_plan(&cfg, g_key_sample, refs, &n_refs) != 0) {
+    if (bindings_plan(&cfg, g_key_sample, g_refs, &g_n_refs) != 0) {
         config_free(&cfg);
         return EXIT_FAILURE;
     }
@@ -1687,7 +2214,7 @@ main(int argc, char **argv) {
     else
         snprintf(devdesc, sizeof(devdesc), "%zu device(s)", cfg.n_devices);
     LOG_INFO("Config: %s, %zu key(s) on %d sample(s), audio=%s",
-             devdesc, cfg.n_bind, n_refs,
+             devdesc, cfg.n_bind, g_n_refs,
              cfg.audio_enabled ? "enabled" : "disabled");
     for (size_t i = 0; i < cfg.n_bind; i++)
         LOG_INFO("  %-14s -> %s @ %.2f", key_name_or(cfg.bind[i].key),
@@ -1707,10 +2234,10 @@ main(int argc, char **argv) {
      * id unmapped, and audio_trigger treats that as nothing to play - so
      * those keys go silent and the rest still sound. */
     if (cfg.audio_enabled) {
-        for (int i = 0; i < n_refs; i++)
-            if (audio_load(i, refs[i].path, refs[i].gain) != 0)
+        for (int i = 0; i < g_n_refs; i++)
+            if (audio_load(i, g_refs[i].path, g_refs[i].gain) != 0)
                 LOG_WARN("hitsound load failed (%s); the keys bound to it "
-                         "stay silent", refs[i].path);
+                         "stay silent", g_refs[i].path);
 
         audio_start(cfg.audio_latency);
     } else {
@@ -1721,17 +2248,27 @@ main(int argc, char **argv) {
                  "and play nothing");
     }
 
-    /* handlers for graceful shutdown. */
+    /* Handlers for graceful shutdown, and for SIGHUP -> reload. The eventfd
+     * comes first so the handler always has somewhere to poke: a SIGHUP that
+     * only set a flag would not be acted on until the next key event, since
+     * epoll_wait is where this process spends its life. No SA_RESTART, so a
+     * signal landing before the fd is watched still breaks the wait. */
+    g_sigfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_sigfd < 0)
+        LOG_WARN("eventfd: %s - SIGHUP reload may be delayed until the next "
+                 "key event", strerror(errno));
+
     struct sigaction sa = { .sa_handler = on_signal };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     /* run_loop opens devices itself (initial reconcile + hotplug). */
     dev_list_t devs = { 0 };
     LOG_INFO("Running.");
-    int rc = run_loop(&devs, &cfg, input_dir);
+    int rc = run_loop(&devs, &cfg, input_dir, config_path);
 
     LOG_INFO("Shutting down");
 
@@ -1743,6 +2280,7 @@ main(int argc, char **argv) {
     }
     free(devs.v);
     audio_cleanup();
+    if (g_sigfd >= 0) close(g_sigfd);
     config_free(&cfg);
     return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
