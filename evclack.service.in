@@ -1,0 +1,31 @@
+[Unit]
+Description=evclack keyboard hitsound daemon
+Documentation=https://github.com/zakack/evclack
+Wants=pipewire.service
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/evclack
+Restart=on-failure
+RestartSec=2s
+Environment=PIPEWIRE_LATENCY=16/48000
+
+# This is a user unit: enable it with
+#   systemctl --user enable --now evclack
+#
+# It must NOT be a root system service. PipeWire is a per-user session
+# daemon, so a service outside your session would have no audio at all.
+#
+# The daemon needs read access to /dev/input/event*, which is what
+# membership in the `input` group covers:
+#   sudo usermod -aG input $USER   # then log out and back in
+#
+# Nothing is grabbed and no uinput device is created, so there is no udev
+# rule to install and no write access to anything under /dev.
+#
+# Config is read from ~/.config/evclack/config.yaml, falling back to
+# @CMAKE_INSTALL_FULL_DATADIR@/evclack/config.yaml.
+
+[Install]
+WantedBy=default.target

@@ -3,7 +3,7 @@
  * mixtest - assertions over the audio voice pool, the trigger ring and the
  * summed output buffer.
  *
- * Includes doubletapd.c and calls the daemon's own trigger() and
+ * Includes evclack.c and calls the daemon's own trigger() and
  * audio_mix(), so it exercises the real mixer rather than a copy. There is
  * no PipeWire here at all: audio_mix takes a plain float buffer, which is
  * exactly why the mix was factored out of on_process.
@@ -17,8 +17,8 @@
  */
 #include <math.h>
 
-#define main doubletapd_main
-#include "doubletapd.c"
+#define main evclack_main
+#include "evclack.c"
 #undef main
 
 static int fails;
@@ -76,7 +76,14 @@ static void trigger_at(int sample, uint64_t t_ns) {
 /* Reset the whole audio subsystem: samples, pool, ring. Nothing here reaches
  * into internals the daemon does not own - it is the startup state. */
 static void fresh(float gain0, float gain1) {
-    float gains[AUDIO_NSAMPLES] = { gain0, gain1 };
+    /* Every case here uses samples 0 and 1; the rest of the table exists
+     * because AUDIO_NSAMPLES is a config ceiling, not a fixture size. Give
+     * them unity explicitly rather than the 0.0 a short initialiser would
+     * leave, so a case that ever reaches one is not silently muted. */
+    float gains[AUDIO_NSAMPLES];
+    for (int s = 0; s < AUDIO_NSAMPLES; s++) gains[s] = 1.0f;
+    gains[0] = gain0;
+    gains[1] = gain1;
     memset(&audio, 0, sizeof audio);
     memset(&trig,  0, sizeof trig);
     for (int s = 0; s < AUDIO_NSAMPLES; s++) {

@@ -1,220 +1,89 @@
-# doubletap configuration
+# evclack configuration
 #
-# The daemon grabs keyboard devices (auto-discovered, or an explicit list),
-# applies a SOCD-cleaning state machine to a pool of configurable physical
-# keys driving two virtual keys (v1/v2), and re-emits everything via a
-# single uinput virtual keyboard. It also plays a click sound through
-# PipeWire on every virtual keypress. Devices are hotplug-aware either way:
-# unplugged keyboards are dropped and re-grabbed when they come back.
+# evclack watches your keyboards and plays a sample on every press of a
+# configured key. It does not grab anything, does not remap anything, and
+# creates no virtual device: the keys reach the rest of the system exactly
+# as they always did, and evclack only listens.
 #
-# Copy this file to ~/.config/doubletap/config.yaml and edit it there;
-# the daemon prefers that path over the installed copy in /usr/share.
+# Copy this file to ~/.config/evclack/config.yaml and edit it there; the
+# daemon prefers that path over the installed copy in /usr/share.
 # After editing, restart the daemon:
-#   systemctl --user restart doubletap
+#   systemctl --user restart evclack
 
-# Keyboard devices to grab. OPTIONAL. When omitted (or set to the scalar
-# "auto"), every keyboard-shaped device that has both k1 and k2 is grabbed
-# automatically: real keyboards only (no mice/touchpads, no other virtual
-# keyboards such as those created by keyd or doubletap itself).
+# Keyboards to listen to. OPTIONAL. When omitted (or set to the scalar
+# "auto"), every keyboard-shaped device that carries EVERY bound key is
+# opened: real keyboards only, no mice or touchpads.
+#
+# Virtual keyboards ARE included, deliberately. Remappers (keyd, doubletap,
+# an on-screen keyboard) grab the physical board exclusively, so the real
+# keystrokes exist only on the uinput device they emit - filtering those out
+# would leave evclack silent on exactly the setups most likely to want it.
+# There is nothing to double up either: a grabbed node yields no events to a
+# passive reader, and evclack emits none of its own.
 #
 # To pin specific keyboards instead, list them explicitly. Use the stable
-# /dev/input/by-id/* paths so the entries survive replug
+# /dev/input/by-id/* paths so the entries survive a replug
 # (ls /dev/input/by-id/ and pick the *-event-kbd entry for your keyboard).
+# Either way, hotplug is handled: unplugged keyboards are dropped and
+# reopened when they come back.
 #
 # devices:
 #   - /dev/input/by-id/CHANGE-ME-event-kbd
 
-# SOCD-cleaning mode. toggle and snappy both suppress the older key when
-# both are held; they differ in what happens when one of two held keys is
-# released:
-#   toggle - reverting toggle (latching): releasing EITHER key re-presses
-#            the other virtual key. "on" is a synonym.
-#   snappy - "Snappy Tappy" / last input wins: only releasing the ACTIVE
-#            key falls back to the still-held one; releasing the already
-#            suppressed key does nothing.
-#   off    - no SOCD cleaning: pool keys are simply remapped to v1/v2
-#            (audio click still plays on each press). With a pool LARGER
-#            than two this also drops the sticky rule, so repeated taps of
-#            one key alternate v1/v2 instead of repeating - plain
-#            alternating output riding under the real keys. The two-key
-#            form keeps the old strict 1:1 mapping.
-#   analog - toggle, but driven by how far the keys are actually pressed
-#            rather than by a single fixed actuation point. Requires an
-#            analog keyboard; see the `analog` section below. Falls back to
-#            `toggle` (with a warning) if no analog device is found.
-socd: toggle
-
-# Key mapping. Codes can be symbolic ("KEY_Z") or numeric (44).
-# See /usr/include/linux/input-event-codes.h for the full list.
+# Which keys make a sound, and what they play. REQUIRED - a key that is not
+# listed here is silent.
 #
-# v1/v2 are the two virtual keys the daemon emits. The PHYSICAL side is a
-# pool of any size: every key in it drives those same two virtual keys, and
-# which of the two a key gets is decided per press rather than fixed here.
+# Each entry is either a bare key code, or a mapping with a per-key `sample`
+# and/or `gain`. Codes can be symbolic ("KEY_Z") or numeric (44); see
+# /usr/include/linux/input-event-codes.h for the full list.
 #
-#   k1/k2       - the two-key form. Unchanged, and still the default.
-#   pool: [...] - two or more keys (up to 16). Mutually exclusive with
-#                 k1/k2, which are just the two-entry spelling of it.
+# Anything an entry leaves out comes from the `audio` block below, so the
+# common case - a handful of keys, one sound - is just a list of names. The
+# two blocks may appear in either order.
 #
-# How a key picks its virtual, in order:
-#
-#   1. STICKY. A key reuses the virtual it drove last time, whenever that
-#      one is free. So a key tapped on its own always gives the same
-#      virtual, and a two-key pool behaves exactly as k1/k2 always did.
-#   2. Otherwise the FREE one. This is what makes any sequence of distinct
-#      keys alternate: Z X C V comes out v1 v2 v1 v2, and so does C V C V.
-#   3. If BOTH are held - a third key down at once - the newcomer alternates
-#      off the last press and shares that virtual. It still counts as a
-#      press (the toggle fires for it), and its release does nothing while
-#      the key sharing with it is still down.
-#
-# Pool keys are CONSUMED: a pool key emits only v1/v2, never its own code.
-# Everything outside the pool passes through untouched.
-#
-# Auto-discovery grabs a keyboard only if it has EVERY pool key.
+# Bindings that name the same file AND the same gain share one loaded
+# sample, so pointing ten keys at one hitsound decodes it once. That is the
+# only real ceiling here: 24 DISTINCT (file, gain) pairs. The number of
+# bound KEYS is not limited.
 keys:
-  k1: KEY_Z
-  k2: KEY_X
-  v1: KEY_Z
-  v2: KEY_X
-  # pool: [KEY_Z, KEY_X, KEY_C, KEY_V]   # instead of k1/k2
-  #
-  # Analog mode only: which two pool keys arm the deep latch by being
-  # planted together. Defaults to the first two. Every other pool key is
-  # still read by travel, but cannot arm the latch and goes SILENT while it
-  # is armed - during a rock, the two latch keys own both virtuals.
-  # latch: [KEY_Z, KEY_X]
+  - KEY_Z
+  - KEY_X
+  # - {key: KEY_C, sample: /usr/share/evclack/clack.wav}
+  # - {key: KEY_V, gain: 0.6}
 
-# Audio click on each virtual keypress, played through PipeWire.
+# The sound.
 #
-# `wav` is the base sample and `gain` (linear, 1.0 = unity) the base volume,
-# used for BOTH virtual keys unless overridden per-key below.
+# `sample` is the default sample and `gain` (linear, 1.0 = unity) the
+# default volume, used by every binding that does not override them.
 #
-# Per-key overrides let V1 and V2 have their own sound and/or volume:
-#   wav_v1 / wav_v2   - separate samples for the two keys (each falls back
-#                       to `wav` when omitted)
-#   gain_v1 / gain_v2 - separate volumes (each falls back to `gain`)
-# Setting `wav` alongside a single override is fine (not a conflict): the
-# override wins for its key, `wav` covers the other. Point samples at any
-# format libsndfile reads - WAV (any bit depth, including float and
-# WAVE_FORMAT_EXTENSIBLE), FLAC, OGG/Vorbis, Opus and MP3 - at any sample
-# rate and channel count. An osu! skin's hitsounds work as they ship, with no
-# transcoding. The daemon decodes and resamples once at startup so everything
-# shares one output.
+# Point samples at any format libsndfile reads - WAV (any bit depth,
+# including float and WAVE_FORMAT_EXTENSIBLE), FLAC, OGG/Vorbis, Opus and
+# MP3 - at any sample rate and channel count. An osu! skin's hitsounds work
+# as they ship, with no transcoding. Everything is decoded and resampled
+# once at startup so it can all share one output.
 #
-# EVERY click overlaps rather than cutting off the one before it, including
-# two presses of the SAME key. The daemon opens a single output node and
-# mixes internally: each press takes its own voice from a pool of 32, and
-# plays out to its end. This matters most at speed - the shipped click is
-# 125ms and a 300 BPM stream is one tap every 50ms, so anything that
-# restarted playback would clip every note of a burst to 40% and thin out
-# the sound exactly when you are listening hardest.
+# EVERY sound overlaps rather than cutting off the one before it, including
+# two presses of the SAME key. evclack opens a single output node and mixes
+# internally: each press takes its own voice from a pool of 32 and plays out
+# to its end. This matters most at speed - the shipped click is 125ms and a
+# 300 BPM stream is one tap every 50ms, so anything that restarted playback
+# would clip every note of a burst to 40% and thin out the sound exactly
+# when you are listening hardest.
 #
-# `latency` is the output quantum requested from PipeWire, in frames at 48kHz.
-# Without it the node inherits the graph quantum - 1024 on a stock PipeWire,
-# so a click landed anywhere in a 21ms window and a burst came out unevenly
-# spaced. 256 frames is 5.3ms, and a trigger is placed at the frame it
-# actually fell on within that buffer, so the spacing between two taps
+# `latency` is the output quantum requested from PipeWire, in frames at
+# 48kHz. Without it the node inherits the graph quantum - 1024 on a stock
+# PipeWire, so a click landed anywhere in a 21ms window and a burst came out
+# unevenly spaced. 256 frames is 5.3ms, and a trigger is placed at the frame
+# it actually fell on within that buffer, so the spacing between two taps
 # survives to the speaker.
 #
-# Lower is not free, and the cost is not local: PipeWire runs the WHOLE graph
-# at the minimum latency any node asks for, so this daemon holds the entire
-# session at whatever you set here for as long as it runs. 256 is right for
-# wired output; a Bluetooth headset or a loaded machine may want 512 or 1024
-# (and will crackle if you insist otherwise). Range 16..8192.
+# Lower is not free, and the cost is not local: PipeWire runs the WHOLE
+# graph at the minimum latency any node asks for, so this daemon holds the
+# entire session at whatever you set here for as long as it runs. 256 is
+# right for wired output; a Bluetooth headset or a loaded machine may want
+# 512 or 1024 (and will crackle if you insist otherwise). Range 16..8192.
 audio:
   enabled: true
-  wav: /usr/share/doubletap/click.wav
+  sample: /usr/share/evclack/click.wav
   gain: 1.0
   latency: 256
-  # wav_v1: /usr/share/doubletap/click.wav
-  # wav_v2: /usr/share/doubletap/clack.wav
-  # gain_v1: 1.0
-  # gain_v2: 0.8
-
-# Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
-#
-# Analog keyboards report how far each key is pressed, not just whether it
-# is down. That lets one session serve BOTH play patterns instead of making
-# you pick one here:
-#
-#   alt-tapping  - alternating discrete taps between k1 and k2. Wants `off`:
-#                  at speed the taps overlap, and a toggle reads that
-#                  overlap as a rock and re-presses a key you never struck.
-#   rocking      - both fingers planted, rocking between the keys. Wants
-#                  `toggle`, for gap-free alternation.
-#
-# The switch between them is the `deep` latch:
-#
-#   ARMS   when BOTH latch keys are on the backplate in one report -> toggle
-#   DISARMS when BOTH latch keys are off the backplate             -> off
-#
-# With a pool larger than two, every pool key is still read by travel - so
-# the daemon's own rapid trigger governs all of them rather than half
-# running the firmware's actuation instead - but only the latch pair can arm
-# it, and the rest go silent for the duration of a rock.
-#
-# Planting both keys is the rock and nothing else is: alt-tapping's defining
-# shape is one finger leaving as the other arrives, so the two are never on
-# the floor together however fast you play. Until it arms, the two keys stay
-# fully independent and an incidental overlap costs nothing.
-#
-# Because the backplate is a hard physical stop, this is a trigger you can
-# aim - "plant both keys to start rocking" is something you can actually do,
-# unlike "cross some depth in the middle of travel". Where the backplate
-# starts is rapid_trigger.bottom_out_mm, the single most important number
-# here: it defines the latch AND the rapid-trigger bottom-out line.
-#
-# Arming is silent - it emits no press and no click, since the notes for
-# both keys already landed when they bottomed. One key held deep while the
-# other is tapped is NOT treated as anything special; the two keys' depths
-# are never compared against each other.
-#
-# While the latch is armed the backplate IS the switch: a key counts as down
-# while it is against the floor and up as soon as it leaves, and rapid trigger
-# does not run at all. That is what riding already is - you bottom out every
-# stroke - so every note in a burst lands on the same hard physical line
-# instead of at whatever depth a reversal distance happened to fall.
-#
-# It also means ONE finger lifting clear does not end the latch. In a burst a
-# finger routinely comes right off the switch while the other stays planted;
-# ending the latch there would send the next note through the tapping profile
-# at actuation_mm, landing it early. Only both fingers leaving the floor ends
-# it, and that release is silent.
-#
-# Rapid trigger (press_mm/release_mm) therefore applies to TAPPING only.
-#
-# Run `doubletapd -A` to watch live travel depth and pick numbers against
-# your own hands, or `doubletapd -T > s.csv` to record a session and replay
-# it offline (see the replay tool). Recording your own alt-tapping and
-# checking that `replay` reports ZERO latches is the test that matters.
-#
-# Turn OFF the keyboard's own rapid trigger and SOCD (Snappy Tappy / Rappy
-# Snappy) in its configuration tool - the daemon does both itself here, and
-# on-board versions will fight it.
-#
-# analog:
-#   device: auto          # or an explicit /dev/hidrawN
-#   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
-#   actuation_mm: 1.0     # press threshold while TAPPING. Not used while
-#                         # riding, where the backplate is the switch.
-#   rapid_trigger:
-#     enabled: true
-#     press_mm: 0.3       # downward reversal that re-presses  } tapping
-#     release_mm: 0.3     # upward reversal that releases      } only
-#     bottom_out_mm: 0.2  # where the backplate starts, measured from full
-#                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
-#                         # out always presses however small the
-#                         # down-travel, it is what arms the deep latch when
-#                         # both keys reach it, and while the latch is armed
-#                         # it is the ONLY threshold. Must be > 0; keep
-#                         # it under ~10% of travel, or a firm tap can
-#                         # reach it and alt-tapping may arm the latch.
-#   hid_k1: auto          # HID usage ids; derived from the keyboard's own
-#   hid_k2: auto          # keymap unless pinned here (see -A)
-#   # With keys.pool, use the list form instead - one entry per pool key,
-#   # in pool order. Mutually exclusive with hid_k1/hid_k2.
-#   hid: [auto, auto, auto, auto]
-
-# Identification of the virtual uinput keyboard.
-uinput:
-  name: "doubletap virtual keyboard"
