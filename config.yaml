@@ -56,6 +56,10 @@ keys:
 # `sample` is the default sample and `gain` (linear, 1.0 = unity) the
 # default volume, used by every binding that does not override them.
 #
+# Leave `sample` out entirely and the installed default click is used,
+# whatever prefix evclack was built with - which is why it is commented out
+# below rather than spelled as a path.
+#
 # Point samples at any format libsndfile reads - WAV (any bit depth,
 # including float and WAVE_FORMAT_EXTENSIBLE), FLAC, OGG/Vorbis, Opus and
 # MP3 - at any sample rate and channel count. An osu! skin's hitsounds work
@@ -84,6 +88,6 @@ keys:
 # 512 or 1024 (and will crackle if you insist otherwise). Range 16..8192.
 audio:
   enabled: true
-  sample: /usr/share/evclack/click.wav
+  # sample: /usr/share/evclack/click.wav
   gain: 1.0
   latency: 256

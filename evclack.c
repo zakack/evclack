@@ -969,8 +969,8 @@ static int load_config(const char *path, evclack_config_t *c) {
     }
 
     /* devices: optional sequence of scalar paths. Omitted (or the scalar
-     * "auto") means auto-discovery: grab every keyboard-shaped device that
-     * advertises both k1 and k2 (see auto_grab_ok). ------------------- */
+     * "auto") means auto-discovery: open every keyboard-shaped device that
+     * advertises every bound key (see auto_open_ok). ------------------ */
     yaml_node_t *devs = map_get(&doc, root, "devices");
     if (!devs ||
         (devs->type == YAML_SCALAR_NODE &&
@@ -1285,8 +1285,8 @@ static int auto_open_ok(struct libevdev *dev, const evclack_config_t *cfg) {
     return 1;
 }
 
-/* Open, vet, and grab one event node. Returns NULL (silently, for the
- * expected cases) when the device shouldn't or can't be grabbed. */
+/* Open and vet one event node. Returns NULL (silently, for the expected
+ * cases) when the device isn't one we should be listening to. */
 static input_dev_t *input_try_open(const char *path, const evclack_config_t *cfg,
                                    int auto_mode, int quiet) {
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -1377,7 +1377,7 @@ static int is_event_node(const struct dirent *d) {
     return strncmp(d->d_name, "event", 5) == 0;
 }
 
-static void try_grab(dev_list_t *devs, const char *path,
+static void try_open(dev_list_t *devs, const char *path,
                      const evclack_config_t *cfg, int auto_mode, int loud,
                      int epfd) {
     struct stat st;
@@ -1389,7 +1389,7 @@ static void try_grab(dev_list_t *devs, const char *path,
     if (!S_ISCHR(st.st_mode))
         return;
     if (dev_list_has_rdev(devs, st.st_rdev))
-        return; /* already grabbed (possibly via another path/symlink) */
+        return; /* already open (possibly via another path/symlink) */
 
     input_dev_t *in = input_try_open(path, cfg, auto_mode, !loud);
     if (!in)
@@ -1405,7 +1405,7 @@ static void try_grab(dev_list_t *devs, const char *path,
     }
 }
 
-/* (Re)open whatever should be grabbed but currently isn't: every configured
+/* (Re)open whatever should be open but currently isn't: every configured
  * path in explicit mode, every matching event node under input_dir in auto
  * mode. Runs at startup (loud) and again on every inotify event under
  * input_dir (quiet - the same non-matching nodes get revisited each time). */
@@ -1413,7 +1413,7 @@ static void reconcile_devices(dev_list_t *devs, const evclack_config_t *cfg,
                               const char *input_dir, int epfd, int loud) {
     if (!cfg->auto_discover) {
         for (size_t i = 0; i < cfg->n_devices; i++)
-            try_grab(devs, cfg->device_paths[i], cfg, 0, loud, epfd);
+            try_open(devs, cfg->device_paths[i], cfg, 0, loud, epfd);
         return;
     }
 
@@ -1426,7 +1426,7 @@ static void reconcile_devices(dev_list_t *devs, const evclack_config_t *cfg,
     for (int i = 0; i < n; i++) {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", input_dir, ents[i]->d_name);
-        try_grab(devs, path, cfg, 1, loud, epfd);
+        try_open(devs, path, cfg, 1, loud, epfd);
         free(ents[i]);
     }
     free(ents);
