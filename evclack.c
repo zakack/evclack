@@ -1526,6 +1526,32 @@ static input_dev_t *input_try_open(const char *path, const evclack_config_t *cfg
     }
 
     if (auto_mode && !auto_open_ok(dev, cfg)) {
+        /* Say WHY, when the thing rejected was obviously a keyboard.
+         *
+         * Discovery rejecting a board is normally uninteresting - most
+         * event nodes are power buttons and video buses - so this path is
+         * silent by design. But the one interesting case is a real keyboard
+         * turned away for missing ONE bound key, and it is the failure mode
+         * a soundpack import walks straight into: a pack binds a hundred
+         * keys whether or not the board has them, and the symptom is a
+         * daemon that starts, says "Running." and never makes a sound.
+         * devices_refilter logs this when a RELOAD closes a board that was
+         * working; without the same line here, a fresh start on a too-wide
+         * config explains nothing at all.
+         *
+         * Gated on `quiet`, which is 0 only for the startup pass, so a
+         * flurry of hotplug rescans cannot turn it into noise. */
+        if (!quiet && !libevdev_has_event_type(dev, EV_REL) &&
+            !libevdev_has_event_type(dev, EV_ABS) &&
+            libevdev_has_event_code(dev, EV_KEY, KEY_A) &&
+            libevdev_has_event_code(dev, EV_KEY, KEY_SPACE)) {
+            int miss = auto_missing_key(dev, cfg);
+            if (miss >= 0)
+                LOG_WARN("Not listening to %s (\"%s\"): it cannot report %s, "
+                         "and auto-discovery needs every bound key. Unbind "
+                         "that key to use this keyboard.",
+                         path, libevdev_get_name(dev), key_name_or(miss));
+        }
         libevdev_free(dev);
         close(fd);
         return NULL;

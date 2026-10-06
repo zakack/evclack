@@ -210,6 +210,19 @@ reverse order.
   unevenly spaced. It must go through libevdev, not a raw `EVIOCSCLOCKID`
   ioctl.
 
+- A KEYBOARD TURNED AWAY BY AUTO-DISCOVERY SAYS SO, AT STARTUP. Discovery
+  is otherwise silent by design - most event nodes are power buttons and
+  video buses, and reporting each one would bury the log. The exception in
+  `input_try_open` is a node that is obviously a keyboard (`EV_KEY` with
+  `KEY_A` and `KEY_SPACE`, no `EV_REL`/`EV_ABS`) rejected for a missing bound
+  key, which is the one rejection a user needs explained. Without it a
+  too-wide config - the thing a soundpack import produces by default - starts
+  cleanly, logs `Running.`, and never makes a sound, with nothing anywhere
+  saying why. `devices_refilter` logs the same fact when a RELOAD closes a
+  board that was working; this covers the fresh start, which refilter cannot
+  see. Gated on `quiet`, so only the startup pass reports and a burst of
+  hotplug rescans cannot turn it into noise.
+
 - VIRTUAL DEVICES ARE DELIBERATELY NOT FILTERED OUT. `doubletap`'s
   `auto_grab_ok` rejected `BUS_VIRTUAL` to stay loop-free among remappers;
   `auto_open_ok` does not, and re-adding the reject would break the case
