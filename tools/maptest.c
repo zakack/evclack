@@ -229,7 +229,10 @@ int main(void) {
 
     puts("H. more than AUDIO_NSAMPLES distinct samples is rejected");
     {
-        char yaml[4096];
+        /* Sized off AUDIO_NSAMPLES, not a round number: this generates a
+         * line per distinct sample, so a raised ceiling silently truncated
+         * the config and turned this case into a no-op that still passed. */
+        char yaml[64 * (AUDIO_NSAMPLES + 4)];
         size_t o = (size_t)snprintf(yaml, sizeof yaml,
                                     "audio: {sample: /s/base.wav}\nkeys:\n");
         /* One distinct gain per key, so nothing interns. */
@@ -237,6 +240,7 @@ int main(void) {
             o += (size_t)snprintf(yaml + o, sizeof yaml - o,
                                   "  - {key: %d, gain: %.4f}\n",
                                   KEY_A + i, 0.01 * (i + 1));
+        expect_int("the fixture fits", o < sizeof yaml, 1);
         expect_int("load_config", load_yaml(yaml, &cfg), 0);
         expect_int("bindings", (long long)cfg.n_bind, AUDIO_NSAMPLES + 1);
         expect_int("bindings_plan rejects it",

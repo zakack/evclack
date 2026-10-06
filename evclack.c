@@ -163,8 +163,16 @@ static int audio_available;
  * one-stream-per-sample design, and that is exactly what made overlapping
  * clicks impossible. Keeping the two literals different is a stronger
  * statement than a comment saying they differ. The ring entry is a uint8_t,
- * so anything under 256 works. */
-#define AUDIO_NSAMPLES 24
+ * so anything under 256 works.
+ *
+ * 160 rather than the two dozen a hand-written config needs, because an
+ * IMPORTED PACK is what sets the floor now: a Mechvibes soundpack slices one
+ * recording into a separate sound per key, so ~100 distinct samples is the
+ * ordinary case rather than the pathological one. The cost is the static
+ * audio.sample[] table and two scratch arrays a reload puts on the stack -
+ * 24 bytes an entry, so a few KB - not decode time, which is paid per
+ * sample the config actually names. */
+#define AUDIO_NSAMPLES 160
 
 /* Concurrent sounds. Far more than a pair of fingers can ask for; the pool
  * is ~1KB static and exhaustion is a formality (see mix_voice_alloc). */

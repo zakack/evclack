@@ -98,6 +98,10 @@ sample files that do not exist. Case F is the load-bearing one — it POISONS
 the table with zeros first, because `.bss` zeros read as "every key plays
 sample 0" and a spot check on the bound key alone would pass. Cases G–I are
 the rejections (duplicate key, over-`AUDIO_NSAMPLES`, missing/empty `keys`).
+Case H is sized off `AUDIO_NSAMPLES` rather than a round number — it
+generates a line per distinct sample, and a fixed 4096-byte buffer silently
+truncated the fixture the moment the ceiling was raised, leaving a case that
+passed while testing nothing.
 K–M cover the reload layer: K pins `refs_same_set` as order-independent and
 permutation-producing, L pins that a REJECTED reload leaves `g_key_sample`
 and `g_refs` byte-identical, and M runs three reorder-only reloads in a row
@@ -443,14 +447,18 @@ reverse order.
   long as it runs. Verified at 256: the node AND the output sink both drop to
   256 frames. Hardcoding it small would be picking a fight with every
   Bluetooth headset on the user's behalf.
-- `AUDIO_NSAMPLES` (24) AND `AUDIO_MAX_VOICES` (32) ARE DIFFERENT NUMBERS
+- `AUDIO_NSAMPLES` (160) AND `AUDIO_MAX_VOICES` (32) ARE DIFFERENT NUMBERS
   and must stay that way — different LITERALS, not merely different in
   principle. They were the same number in the old per-stream design and that
   is exactly what made overlapping clicks impossible. `AUDIO_NSAMPLES` is a
   ceiling on distinct SOUNDS, not on bound keys: `bindings_plan` interns on
   the (path, gain) pair, so ten keys sharing a hitsound cost one entry. More
   keys means growing nothing; more distinct sounds means growing the first
-  alone.
+  alone. It went from 24 to 160 when import landed, and what sets the floor
+  now is an IMPORTED PACK rather than a hand-written config: a Mechvibes
+  soundpack slices one recording into a sound per key, so ~100 distinct
+  samples is the ordinary case. The literals must stay different; 255 is the
+  hard ceiling, since the ring entry is a `uint8_t`.
 - THE OUTPUT IS SUMMED IN FLOAT AND CLAMPED. No limiter, no per-voice
   ducking: with realistic overlap the clamp never engages, and a click is
   not worth a compressor. If a test's expected value comes back exactly

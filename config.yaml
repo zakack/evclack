@@ -55,7 +55,7 @@
 #
 # Bindings that name the same file AND the same gain share one loaded
 # sample, so pointing ten keys at one hitsound decodes it once. That is the
-# only real ceiling here: 24 DISTINCT (file, gain) pairs. The number of
+# only real ceiling here: 160 DISTINCT (file, gain) pairs. The number of
 # bound KEYS is not limited.
 keys:
   - KEY_Z
