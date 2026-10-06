@@ -271,12 +271,12 @@ int main(void) {
 
     puts("K. refs_same_set is order-independent and yields a permutation");
     {
-        sample_ref_t a[3] = { {"/s/a.wav", 1.0f},
-                              {"/s/b.wav", 1.0f},
-                              {"/s/c.wav", 0.5f} };
-        sample_ref_t b[3] = { {"/s/c.wav", 0.5f},
-                              {"/s/a.wav", 1.0f},
-                              {"/s/b.wav", 1.0f} };
+        sample_ref_t a[3] = { {"/s/a.wav", 1.0f, 0, 0},
+                              {"/s/b.wav", 1.0f, 0, 0},
+                              {"/s/c.wav", 0.5f, 0, 0} };
+        sample_ref_t b[3] = { {"/s/c.wav", 0.5f, 0, 0},
+                              {"/s/a.wav", 1.0f, 0, 0},
+                              {"/s/b.wav", 1.0f, 0, 0} };
         int map[AUDIO_NSAMPLES];
 
         expect_int("reordered set matches", refs_same_set(a, 3, b, 3, map), 1);
@@ -286,13 +286,14 @@ int main(void) {
 
         /* Same file, different gain, is a DIFFERENT sound - the interning
          * rule is on the pair, so the compare has to be too. */
-        sample_ref_t c[3] = { {"/s/a.wav", 1.0f},
-                              {"/s/b.wav", 1.0f},
-                              {"/s/c.wav", 0.9f} };
+        sample_ref_t c[3] = { {"/s/a.wav", 1.0f, 0, 0},
+                              {"/s/b.wav", 1.0f, 0, 0},
+                              {"/s/c.wav", 0.9f, 0, 0} };
         expect_int("a changed gain does not match",
                    refs_same_set(a, 3, c, 3, map), 0);
 
-        sample_ref_t d[2] = { {"/s/a.wav", 1.0f}, {"/s/b.wav", 1.0f} };
+        sample_ref_t d[2] = { {"/s/a.wav", 1.0f, 0, 0},
+                              {"/s/b.wav", 1.0f, 0, 0} };
         expect_int("a smaller set does not match",
                    refs_same_set(a, 3, d, 2, map), 0);
     }
@@ -395,6 +396,138 @@ int main(void) {
                           "  - {key: KEY_X, sample: /s/b.wav}\n",
                           &live, &action), 0);
         expect_int("  action", (long long)action, RELOAD_SAMPLES);
+
+        audio.sample[0].samples = NULL;
+        audio.sample[1].samples = NULL;
+        audio_available = 0;
+        config_free(&live);
+    }
+
+    /* --- The sprite-sheet layer: one file, one sound per key. -------- */
+
+    puts("N. a slice is part of a sample's identity");
+    {
+        /* Exactly the shape an imported Mechvibes pack has: every binding
+         * names the SAME file and differs only in the window. Interning on
+         * the path alone would collapse all four onto one sound, and every
+         * key would play the same slice - the failure this case exists for.
+         */
+        expect_int("load_config",
+                   load_yaml("audio: {sample: /s/pack.ogg}\n"
+                             "keys:\n"
+                             "  - {key: KEY_A, start: 12946, end: 13137}\n"
+                             "  - {key: KEY_B, start: 13470, end: 13660}\n"
+                             "  - {key: KEY_C, start: 12946, end: 13137}\n"
+                             "  - KEY_D\n", &cfg), 0);
+        expect_int("bindings_plan",
+                   bindings_plan(&cfg, table, refs, &n_refs), 0);
+
+        /* Three distinct sounds, not four and not one: A and C name the same
+         * window and share a slot, D takes the whole file. */
+        expect_int("distinct samples", n_refs, 3);
+        expect_int("KEY_A and KEY_C share a slice",
+                   table[KEY_A], table[KEY_C]);
+        expect_int("KEY_B is its own slice", table[KEY_B] != table[KEY_A], 1);
+        expect_int("the unsliced binding is its own sample",
+                   table[KEY_D] != table[KEY_A], 1);
+
+        expect_f("start survives the plan", refs[table[KEY_A]].start_ms,
+                 12946.0);
+        expect_f("end survives the plan", refs[table[KEY_A]].end_ms, 13137.0);
+        expect_f("an omitted start is 0", refs[table[KEY_D]].start_ms, 0.0);
+        expect_f("an omitted end is 0", refs[table[KEY_D]].end_ms, 0.0);
+        config_free(&cfg);
+    }
+
+    puts("O. a fractional slice survives the parse exactly");
+    {
+        /* Mechvibes-DX writes half-millisecond bounds (45832.5). Narrowing
+         * them to float would move the window AND break the exact compare
+         * refs_same_set does, so this pins the double all the way through. */
+        expect_int("load_config",
+                   load_yaml("audio: {sample: /s/pack.ogg}\n"
+                             "keys:\n"
+                             "  - {key: KEY_A, start: 45832.5, end: 45914.25}\n",
+                             &cfg), 0);
+        expect_int("bindings_plan",
+                   bindings_plan(&cfg, table, refs, &n_refs), 0);
+        expect_f("start", refs[0].start_ms, 45832.5);
+        expect_f("end", refs[0].end_ms, 45914.25);
+        config_free(&cfg);
+    }
+
+    puts("P. nonsense slices are rejected by load_config");
+    {
+        expect_int("end before start",
+                   load_yaml("audio: {sample: /s/a.wav}\n"
+                             "keys:\n  - {key: KEY_Z, start: 500, end: 100}\n",
+                             &cfg), -1);
+        config_free(&cfg);
+        expect_int("end equal to start",
+                   load_yaml("audio: {sample: /s/a.wav}\n"
+                             "keys:\n  - {key: KEY_Z, start: 500, end: 500}\n",
+                             &cfg), -1);
+        config_free(&cfg);
+        expect_int("a negative start",
+                   load_yaml("audio: {sample: /s/a.wav}\n"
+                             "keys:\n  - {key: KEY_Z, start: -1}\n",
+                             &cfg), -1);
+        config_free(&cfg);
+        expect_int("a non-numeric start",
+                   load_yaml("audio: {sample: /s/a.wav}\n"
+                             "keys:\n  - {key: KEY_Z, start: soon}\n",
+                             &cfg), -1);
+        config_free(&cfg);
+
+        /* A start with no end is legal: play from there to the end. */
+        expect_int("start alone is fine",
+                   load_yaml("audio: {sample: /s/a.wav}\n"
+                             "keys:\n  - {key: KEY_Z, start: 500}\n",
+                             &cfg), 0);
+        expect_f("  start", cfg.bind[0].start_ms, 500.0);
+        expect_f("  end stays open", cfg.bind[0].end_ms, 0.0);
+        config_free(&cfg);
+    }
+
+    puts("Q. re-slicing forces a re-decode; reordering slices does not");
+    {
+        evclack_config_t live;
+        unsigned action = 0;
+        static float dummy[8];
+
+        config_init(&live);
+        expect_int("initial load",
+                   reload("audio: {sample: /s/pack.ogg}\n"
+                          "keys:\n"
+                          "  - {key: KEY_Z, start: 100, end: 200}\n"
+                          "  - {key: KEY_X, start: 300, end: 400}\n",
+                          &live, &action), 0);
+
+        /* Stand the fast path up by hand, as case M does: it only engages
+         * when audio is up and every committed ref actually loaded. These
+         * buffers are never dereferenced. */
+        audio_available = 1;
+        audio.sample[0].samples = dummy;
+        audio.sample[1].samples = dummy;
+
+        expect_int("reordering the same two slices",
+                   reload("audio: {sample: /s/pack.ogg}\n"
+                          "keys:\n"
+                          "  - {key: KEY_X, start: 300, end: 400}\n"
+                          "  - {key: KEY_Z, start: 100, end: 200}\n",
+                          &live, &action), 0);
+        expect_int("  nothing to rebuild", (long long)action, RELOAD_NONE);
+
+        /* One window moved by a single millisecond. Same file, same gain,
+         * same count - so only a slice-aware compare can see it, and missing
+         * it leaves that key playing the OLD region of the pack forever. */
+        expect_int("moving one slice",
+                   reload("audio: {sample: /s/pack.ogg}\n"
+                          "keys:\n"
+                          "  - {key: KEY_Z, start: 100, end: 200}\n"
+                          "  - {key: KEY_X, start: 300, end: 401}\n",
+                          &live, &action), 0);
+        expect_int("  forces a re-decode", (long long)action, RELOAD_SAMPLES);
 
         audio.sample[0].samples = NULL;
         audio.sample[1].samples = NULL;

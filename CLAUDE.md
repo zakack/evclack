@@ -74,6 +74,10 @@ exists the watch is on the fallback's directory. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
 testing against a directory of symlinks to synthetic uinput nodes.
 
+A binding may also carry `start`/`end`, a window in milliseconds selecting
+part of the sample file rather than all of it. Both omitted (the ordinary
+case) means the whole file.
+
 `tools/mixtest.c` is a unit test that `#include`s `evclack.c` outright, so it
 exercises the daemon's real mixer rather than a copy that could drift; keep
 it that way. It needs no PipeWire and no stubs: `audio_mix` is the whole
@@ -98,11 +102,15 @@ sample files that do not exist. Case F is the load-bearing one — it POISONS
 the table with zeros first, because `.bss` zeros read as "every key plays
 sample 0" and a spot check on the bound key alone would pass. Cases G–I are
 the rejections (duplicate key, over-`AUDIO_NSAMPLES`, missing/empty `keys`).
-Case H is sized off `AUDIO_NSAMPLES` rather than a round number — it
+N–Q cover the slice layer: N pins that a slice is part of a sample's
+identity (four bindings on one file collapsing to three sounds, which is the
+shape an imported pack has), O that a half-millisecond bound survives the
+parse exactly, P the rejections, and Q that moving one slice by a
+millisecond forces `RELOAD_SAMPLES` while reordering the same slices does
+not. Case H is sized off `AUDIO_NSAMPLES` rather than a round number — it
 generates a line per distinct sample, and a fixed 4096-byte buffer silently
 truncated the fixture the moment the ceiling was raised, leaving a case that
-passed while testing nothing.
-K–M cover the reload layer: K pins `refs_same_set` as order-independent and
+passed while testing nothing. K–M cover the reload layer: K pins `refs_same_set` as order-independent and
 permutation-producing, L pins that a REJECTED reload leaves `g_key_sample`
 and `g_refs` byte-identical, and M runs three reorder-only reloads in a row
 to catch a `reload_commit` that writes `g_refs` in plan order instead of
@@ -266,11 +274,18 @@ reverse order.
   sound is ever wanted, it is a schema change (a per-binding `up:` sample),
   not a relaxed condition here.
 
-- INTERNING IS ON THE (PATH, GAIN) PAIR, not on the path alone. Interning on
-  the path would force `audio_sample_t` to split buffer ownership from gain,
-  which ripples into `audio_cleanup`'s frees and into every test that pokes
-  at `audio.sample[]` — refcounts, to buy a case (one file at two volumes)
-  that costs exactly one extra decode today.
+- INTERNING IS ON THE WHOLE (PATH, GAIN, START, END) TUPLE, not on the path
+  alone. Interning on the path would force `audio_sample_t` to split buffer
+  ownership from gain, which ripples into `audio_cleanup`'s frees and into
+  every test that pokes at `audio.sample[]` — refcounts, to buy a case (one
+  file at two volumes) that costs exactly one extra decode today. Since
+  soundpack import it would also be plain WRONG rather than merely wasteful:
+  every key of a Mechvibes pack names the same path and differs only in the
+  slice, so a path-keyed intern would collapse the whole pack onto one sound
+  and play the same 90ms of it for every key. `refs_same_set` compares the
+  same four fields, and must — a slice that moves by one millisecond is a
+  changed sample set that nothing else can see. `maptest` cases N and Q pin
+  both halves.
 
 ## Key invariants to preserve in the config-reload path
 
@@ -350,7 +365,10 @@ reverse order.
   changes the sample set drops the keypresses landing during it and can xrun
   the graph. Bounded, and user-triggered; the alternative is decoding in RT,
   which is not an alternative. Worth knowing before anything else is added to
-  the reload path.
+  the reload path. AN IMPORTED PACK MAKES THAT WINDOW MUCH LARGER — a hundred
+  slices rather than one or two, measured at roughly a second and a half for
+  a 99-key pack — which is exactly what `audio_load_refs`'s decode cache is
+  bounding. Without it the same reload is minutes, not seconds.
 
 ## Key invariants to preserve when editing the audio mixer
 
@@ -375,6 +393,32 @@ reverse order.
 - `audio_mix` DOES NOT ALLOCATE, LOCK, OR MAKE A SYSCALL. It runs on
   PipeWire's RT thread. Anything that would (loading a sample, resizing the
   pool, logging) belongs at startup.
+- SLICING HAPPENS BEFORE `sample_conform`, NEVER AFTER. `slice_window` maps
+  a ref's millisecond window onto SOURCE-rate frames and `audio_load_into`
+  hands `sample_conform` only that span. Cutting afterwards would mean
+  converting the window into resampled frames, and the sinc tail makes that
+  mapping inexact — the pack author measured the window against the file, so
+  the cut belongs in the file's own units. It is also what keeps the conform
+  cost proportional to the audio actually used rather than to the whole
+  recording. The window ROUNDS rather than truncates (truncating biases every
+  slice one frame early, and the front edge is the transient), clamps an
+  overrunning end to the file, and FAILS the load when it selects nothing —
+  a zero-frame sample would reach the mixer as a key that silently does
+  nothing. `mixtest` case P pins all of that.
+
+- `audio_load_refs`'s DECODE CACHE IS LOAD-BEARING, NOT AN OPTIMISATION.
+  Every ref of an imported pack names the SAME 20-60 second file, so
+  decoding per ref would run `SRC_SINC_BEST_QUALITY` over the whole
+  recording a hundred times — minutes of startup, and minutes of
+  epoll-thread stall on every config save. The cache is one slot, which is
+  enough only because `audio_load_refs` groups refs by path before asking;
+  the grouping is the outer loop rather than a sort precisely so ids stay
+  exactly what `bindings_plan` assigned. Measured: a 99-key pack over one
+  55-second ogg loads in under two seconds, with ONE decode and 83 conforms.
+  It is the single entry point for loading a planned set — `main()` and
+  `config_reload` both go through it, and a third caller that loops
+  `audio_load_into` itself would quietly reintroduce the cost.
+
 - SAMPLES ARE CONFORMED AT LOAD, NEVER IN RT. `sample_conform` is the reason
   mixing is possible at all: one shared output buffer means every sample
   must already be at `MIX_RATE`/`MIX_CHANNELS` before the callback sees it.
@@ -391,10 +435,13 @@ reverse order.
   rejected float32 and `WAVE_FORMAT_EXTENSIBLE` (what ffmpeg and Audacity
   emit above 16-bit or 2 channels) and could not open an `.ogg` or `.mp3` at
   all. Verified bit-identical to that reader on the shipped `click.wav`.
-- THE SUBSYSTEM IS ONE REGION WITH A SMALL ENTRY SET: `audio_load`,
+- THE SUBSYSTEM IS ONE REGION WITH A SMALL ENTRY SET: `audio_load_refs`,
   `audio_start`, `audio_trigger`, `audio_mix`, `audio_cleanup` (plus
   `audio_wake_fd`/`audio_restart` for the epoll loop, and
-  `audio_load_into`/`audio_swap_samples`/`audio_relatency` for reload). Sample loading used to
+  `audio_swap_samples`/`audio_relatency` for reload). `audio_load_refs` is
+  the ONLY way a planned set is loaded — both `main()` and `config_reload`
+  go through it, and `audio_load_into`/`slice_window`/`decode_cache_*` are
+  its internals rather than entry points. Sample loading used to
   sit inline in `main()`, outside the banners. It does not any more, and what
   is left in `main()` is only what a DIFFERENT program would write
   differently: which sample id each distinct sound got, and where its path

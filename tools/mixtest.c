@@ -432,6 +432,72 @@ int main(void) {
         expect_f("no cycle time: back to frame 0", out[0], cell(0, 0, 0));
     }
 
+    /* --------------------------------------------------------------- *
+     * Slicing. A Mechvibes soundpack is one recording with a window per
+     * key, so slice_window is what turns "12946-13137 ms" into the frames
+     * sample_conform is handed. It runs on the SOURCE rate, before the
+     * conform, which is the only place the pack author's milliseconds
+     * mean what they say.
+     * --------------------------------------------------------------- */
+
+    puts("P. slice_window: millisecond windows onto source frames");
+    {
+        /* 1000 frames at 1000 Hz, so one frame is exactly one millisecond
+         * and every expected value can be read off by eye. */
+        const size_t N = 1000;
+        size_t first, count;
+        sample_ref_t r = { "/s/pack.ogg", 1.0f, 0.0, 0.0 };
+
+        expect_int("an all-zero window takes the whole file",
+                   slice_window(&r, N, 1000, &first, &count), 0);
+        expect_int("  from frame 0", (long long)first, 0);
+        expect_int("  for every frame", (long long)count, (long long)N);
+
+        r.start_ms = 100.0; r.end_ms = 200.0;
+        expect_int("a closed window", slice_window(&r, N, 1000, &first, &count), 0);
+        expect_int("  first frame", (long long)first, 100);
+        expect_int("  half-open, so 100 frames not 101",
+                   (long long)count, 100);
+
+        r.start_ms = 900.0; r.end_ms = 0.0;
+        expect_int("a start with no end runs to the end",
+                   slice_window(&r, N, 1000, &first, &count), 0);
+        expect_int("  first frame", (long long)first, 900);
+        expect_int("  count", (long long)count, 100);
+
+        /* Rounds, never truncates. Truncating would bias every window one
+         * frame early - a systematic error in the one direction that
+         * matters, since the window's front edge is the transient. */
+        r.start_ms = 100.6; r.end_ms = 200.4;
+        expect_int("a fractional window rounds",
+                   slice_window(&r, N, 1000, &first, &count), 0);
+        expect_int("  start to nearest", (long long)first, 101);
+        expect_int("  end to nearest", (long long)(first + count), 200);
+
+        /* A window running off the end is CLAMPED, not rejected: a pack
+         * whose last slice overruns its own recording by a millisecond
+         * should lose the millisecond, not the key. */
+        r.start_ms = 950.0; r.end_ms = 1200.0;
+        expect_int("an overrunning end clamps",
+                   slice_window(&r, N, 1000, &first, &count), 0);
+        expect_int("  clamped to the file", (long long)(first + count),
+                   (long long)N);
+
+        /* A window entirely past the end selects nothing, and that IS a
+         * load failure - a zero-frame sample would reach the mixer as a
+         * key that silently does nothing. */
+        r.start_ms = 1500.0; r.end_ms = 1600.0;
+        expect_int("a window past the end fails the load",
+                   slice_window(&r, N, 1000, &first, &count), -1);
+
+        /* The rate is the SOURCE file's, not MIX_RATE: the same window on a
+         * 44.1 kHz file is a different frame range. */
+        r.start_ms = 100.0; r.end_ms = 200.0;
+        expect_int("at 44100 Hz", slice_window(&r, 44100, 44100, &first, &count), 0);
+        expect_int("  first frame", (long long)first, 4410);
+        expect_int("  count", (long long)count, 4410);
+    }
+
     printf("\n%s\n", fails ? "FAILURES ABOVE" : "all assertions passed");
     return fails ? 1 : 0;
 }

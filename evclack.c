@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <sched.h>
@@ -189,6 +190,28 @@ typedef struct {
     size_t  num_frames;
     float   gain;        /* linear multiplier, 1.0 = unity */
 } audio_sample_t;
+
+/* ONE DISTINCT SOUND, as the loader is asked for it: a file, the volume to
+ * play it at, and optionally the slice of that file to take.
+ *
+ * `start_ms`/`end_ms` are a half-open window in milliseconds of the SOURCE
+ * file; an all-zero pair means the whole file, which is what every
+ * hand-written binding produces and what the zero-initialised struct already
+ * means. The slice exists because a Mechvibes soundpack is a sprite sheet -
+ * one 20-60 second recording plus a window per key - so the alternative
+ * would be an importer that splits a pack into a hundred derived WAVs and a
+ * config that no longer points at the pack it came from.
+ *
+ * Lives here rather than beside bindings_plan because this is the loader's
+ * input, and audio_load_refs has to see it. Why the interning is on the
+ * whole tuple, and not on the path alone, is bindings_plan's business - the
+ * rationale is with the code that does it. */
+typedef struct {
+    const char *path;
+    float       gain;
+    double      start_ms;   /* 0 with end_ms 0 == the whole file */
+    double      end_ms;     /* 0 == to the end */
+} sample_ref_t;
 
 /* A PLAYING INSTANCE of a sample. This is the thing a keypress allocates.
  * Owned exclusively by the RT thread - only audio_mix() ever reads or writes
@@ -356,36 +379,168 @@ static int sample_conform(const float *in, size_t frames, int ch, int rate,
     return 0;
 }
 
-/* Decode `path`, conform it to the mix format, and map it as sample `idx`.
+/* One decoded file, held only long enough for every ref that names it.
+ *
+ * This is NOT an optimisation, and dropping it does not merely make startup
+ * slower. A Mechvibes pack points a hundred refs at one 50-second .ogg, and
+ * decoding plus SRC_SINC_BEST_QUALITY on 50 seconds of stereo audio costs
+ * seconds; paid a hundred times it is minutes of startup and minutes of
+ * epoll-thread stall on every config save. Caching the decode makes the cost
+ * proportional to the number of FILES, and the conform proportional to the
+ * total sliced audio, which is the shape it has to have.
+ *
+ * One slot is enough because audio_load_refs groups by path before asking. */
+typedef struct {
+    char   *path;      /* strdup; NULL when the slot is empty */
+    float  *raw;
+    size_t  frames;
+    int     ch, rate;
+} decode_cache_t;
+
+static void decode_cache_clear(decode_cache_t *dc) {
+    if (!dc) return;
+    free(dc->path);
+    free(dc->raw);
+    memset(dc, 0, sizeof(*dc));
+}
+
+/* Borrowed on success - the cache keeps ownership and frees on the next
+ * clear. NULL means the file would not decode. */
+static const float *decode_cache_get(decode_cache_t *dc, const char *path,
+                                     size_t *frames, int *ch, int *rate) {
+    if (dc->path && strcmp(dc->path, path) == 0) {
+        *frames = dc->frames; *ch = dc->ch; *rate = dc->rate;
+        return dc->raw;
+    }
+    decode_cache_clear(dc);
+
+    dc->raw = sample_decode(path, &dc->frames, &dc->ch, &dc->rate);
+    if (!dc->raw) return NULL;
+    dc->path = strdup(path);
+    if (!dc->path) { decode_cache_clear(dc); return NULL; }
+
+    *frames = dc->frames; *ch = dc->ch; *rate = dc->rate;
+    return dc->raw;
+}
+
+/* Narrow a decoded buffer to `ref`'s millisecond window, in SOURCE-rate
+ * frames. Returns the first frame and the count; 0 frames means the window
+ * selects nothing, which is a load failure rather than a silent sample.
+ *
+ * SLICING HAPPENS BEFORE sample_conform, NEVER AFTER, and the reason is
+ * arithmetic rather than taste: after conforming, the window would have to
+ * be converted into resampled frames, and the sinc tail means that mapping
+ * is not exact. Cutting first keeps the window in the units the pack author
+ * measured it in, and hands the resampler a buffer that is already only as
+ * long as the sound - which is also what keeps the conform cost
+ * proportional to the audio actually used. */
+static int slice_window(const sample_ref_t *ref, size_t frames, int rate,
+                        size_t *first_out, size_t *count_out) {
+    if (ref->start_ms <= 0.0 && ref->end_ms <= 0.0) {
+        *first_out = 0; *count_out = frames;
+        return 0;
+    }
+
+    double fpms = (double)rate / 1000.0;
+    /* Round rather than truncate, for the same reason the trigger placement
+     * math does: truncating biases every window one frame early. */
+    double fd = ref->start_ms > 0.0 ? ref->start_ms * fpms + 0.5 : 0.0;
+    double ld = ref->end_ms   > 0.0 ? ref->end_ms   * fpms + 0.5
+                                    : (double)frames;
+
+    if (fd < 0.0) fd = 0.0;
+    if (ld > (double)frames) ld = (double)frames;
+
+    size_t first = (size_t)fd;
+    size_t last  = ld > 0.0 ? (size_t)ld : 0;
+
+    if (first >= frames || last <= first) {
+        LOG_WARN("%s: slice %.1f-%.1f ms selects nothing of a %.1f ms file",
+                 ref->path, ref->start_ms, ref->end_ms,
+                 (double)frames / fpms);
+        return -1;
+    }
+
+    *first_out = first;
+    *count_out = last - first;
+    return 0;
+}
+
+/* Decode `ref`, cut it to its window, conform it to the mix format, and
+ * write the result into `dst`.
  *
  * This lives here rather than in main() on purpose: it is the last piece of
  * the audio subsystem that used to sit outside the banners, so everything
  * between them is now the whole of it - load, start, trigger, mix, cleanup.
  * What stays the caller's business is which sample id means what and where
- * the paths and gains came from, which is exactly the part that differs
- * between one program and the next. */
-static int audio_load_into(audio_sample_t *dst, const char *path, float gain) {
-    if (!dst || !path) return -1;
+ * the paths, gains and slices came from, which is exactly the part that
+ * differs between one program and the next.
+ *
+ * `dc` may be NULL, in which case the file is decoded and thrown away. */
+static int audio_load_into(audio_sample_t *dst, const sample_ref_t *ref,
+                           decode_cache_t *dc) {
+    if (!dst || !ref || !ref->path) return -1;
+
+    decode_cache_t own = { 0 };
+    if (!dc) dc = &own;
 
     size_t frames; int ch, rate;
-    float *raw = sample_decode(path, &frames, &ch, &rate);
-    if (!raw) return -1;
+    const float *raw = decode_cache_get(dc, ref->path, &frames, &ch, &rate);
+    if (!raw) { decode_cache_clear(&own); return -1; }
 
-    int rc = sample_conform(raw, frames, ch, rate, dst);
-    free(raw);
+    size_t first, count;
+    if (slice_window(ref, frames, rate, &first, &count) != 0) {
+        decode_cache_clear(&own);
+        return -1;
+    }
+
+    int rc = sample_conform(raw + first * (size_t)ch, count, ch, rate, dst);
+    decode_cache_clear(&own);
     if (rc != 0) return -1;
 
-    dst->gain = gain;
+    dst->gain = ref->gain;
     return 0;
 }
 
-/* The startup form: load straight into the live table. A config reload goes
- * through audio_load_into with a scratch slot instead, because decoding has
- * to finish BEFORE the old buffers can be freed - the RT thread is still
- * playing out of them. */
-static int audio_load(int idx, const char *path, float gain) {
-    if (idx < 0 || idx >= AUDIO_NSAMPLES) return -1;
-    return audio_load_into(&audio.sample[idx], path, gain);
+/* Load a whole planned set into `dst[0..n)`, decoding each distinct FILE
+ * exactly once however many refs slice it.
+ *
+ * The grouping is the outer loop rather than a sort, so the caller's ids are
+ * untouched: refs keep the ids bindings_plan gave them, and only the ORDER
+ * they are visited in changes. A ref that fails to load leaves its slot
+ * zeroed, which audio_trigger already reads as nothing to play - so those
+ * keys go silent and the rest still sound.
+ *
+ * Returns the number that failed. */
+static int audio_load_refs(audio_sample_t *dst, const sample_ref_t *refs,
+                           int n) {
+    if (n > AUDIO_NSAMPLES) n = AUDIO_NSAMPLES;
+
+    bool done[AUDIO_NSAMPLES];
+    memset(done, 0, sizeof(done));
+
+    decode_cache_t dc = { 0 };
+    int failed = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (done[i]) continue;
+        /* i is the first ref naming this file; every later ref naming the
+         * same file rides its decode before the cache moves on. */
+        for (int j = i; j < n; j++) {
+            if (done[j] || !refs[j].path ||
+                strcmp(refs[j].path, refs[i].path) != 0)
+                continue;
+            done[j] = true;
+            if (audio_load_into(&dst[j], &refs[j], &dc) != 0) {
+                LOG_WARN("hitsound load failed (%s); the keys bound to it "
+                         "stay silent", refs[j].path);
+                failed++;
+            }
+        }
+        decode_cache_clear(&dc);
+    }
+    decode_cache_clear(&dc);
+    return failed;
 }
 
 /* Take a voice for `s`. RT side, called only from the ring drain.
@@ -874,11 +1029,18 @@ static void audio_cleanup(void) {
 
 /* One key -> one sample. `sample` and `gain` are NULL / negative when the
  * binding did not override them, and are filled in from audio.sample /
- * audio.gain once the whole file has been read. */
+ * audio.gain once the whole file has been read.
+ *
+ * `start_ms`/`end_ms` select a window of the sample file; both zero means
+ * the whole file, which is what an omitted `start:`/`end:` leaves behind and
+ * what every hand-written binding wants. They exist for imported soundpacks,
+ * where one recording holds every key's sound - see sample_ref_t. */
 typedef struct {
     int    key;
     char  *sample;
     float  gain;
+    double start_ms;
+    double end_ms;
 } binding_t;
 
 typedef struct {
@@ -976,6 +1138,23 @@ static int parse_gain(yaml_node_t *n, float *out) {
     if (end == s || *end != '\0' || errno != 0 || d < 0.0)
         return -1;
     *out = (float)d;
+    return 0;
+}
+
+/* Parse a non-negative time in milliseconds. Kept separate from parse_gain
+ * because it stays a double: a soundpack's slice bounds carry a half
+ * millisecond (45832.5), and narrowing them to float would move a window by
+ * a frame or two AND break the exact compare that lets a reload recognise an
+ * unchanged sample set. */
+static int parse_ms(yaml_node_t *n, double *out) {
+    if (!n || n->type != YAML_SCALAR_NODE) return -1;
+    const char *s = (const char *)n->data.scalar.value;
+    char *end = NULL;
+    errno = 0;
+    double d = strtod(s, &end);
+    if (end == s || *end != '\0' || errno != 0 || d < 0.0 || !isfinite(d))
+        return -1;
+    *out = d;
     return 0;
 }
 
@@ -1103,7 +1282,7 @@ static int load_config(const char *path, evclack_config_t *c) {
     }
     if (keys->type != YAML_SEQUENCE_NODE) {
         LOG_ERR("'keys' must be a sequence of key codes or {key, sample, "
-                "gain} mappings");
+                "gain, start, end} mappings");
         goto out;
     }
     {
@@ -1144,6 +1323,30 @@ static int load_config(const char *path, evclack_config_t *c) {
                 if (gn && parse_gain(gn, &b->gain) != 0) {
                     LOG_ERR("'keys' entry %zu: 'gain' must be a non-negative "
                             "number", c->n_bind + 1);
+                    goto out;
+                }
+                /* A window into the sample, in milliseconds. Validated
+                 * against each other here; whether they fall inside the
+                 * FILE is not knowable without opening it, so that check
+                 * belongs to the loader (slice_window) and costs the one
+                 * sample rather than the whole config. */
+                yaml_node_t *sm = map_get(&doc, item, "start");
+                yaml_node_t *em = map_get(&doc, item, "end");
+                if (sm && parse_ms(sm, &b->start_ms) != 0) {
+                    LOG_ERR("'keys' entry %zu: 'start' must be a "
+                            "non-negative number of milliseconds",
+                            c->n_bind + 1);
+                    goto out;
+                }
+                if (em && parse_ms(em, &b->end_ms) != 0) {
+                    LOG_ERR("'keys' entry %zu: 'end' must be a non-negative "
+                            "number of milliseconds", c->n_bind + 1);
+                    goto out;
+                }
+                if (b->end_ms > 0.0 && b->end_ms <= b->start_ms) {
+                    LOG_ERR("'keys' entry %zu: 'end' (%.1f) must be after "
+                            "'start' (%.1f)", c->n_bind + 1,
+                            b->end_ms, b->start_ms);
                     goto out;
                 }
             } else {
@@ -1231,16 +1434,16 @@ out:
 /* Key bindings                                                              */
 /* ------------------------------------------------------------------------- */
 
-/* One distinct sound: a file and the volume to play it at. Two bindings that
- * agree on both share a slot, so ten keys pointing at one hitsound decode and
- * resample it once. Interning on the PAIR rather than on the path alone is
- * what keeps audio_sample_t owning its buffer outright - split that ownership
- * and audio_cleanup's frees, and every test that pokes at audio.sample[],
- * would have to learn about refcounts to buy a case nobody hits. */
-typedef struct {
-    const char *path;
-    float       gain;
-} sample_ref_t;
+/* sample_ref_t itself is up in the audio region, next to the audio_sample_t
+ * it becomes; what belongs here is why bindings_plan interns on the WHOLE of
+ * it. Two bindings that agree on file, gain AND slice share a slot, so ten
+ * keys pointing at one hitsound decode and resample it once. Interning on
+ * the path alone would keep audio_sample_t from owning its buffer outright -
+ * split that ownership and audio_cleanup's frees, and every test that pokes
+ * at audio.sample[], would have to learn about refcounts to buy a case
+ * nobody hits. It would also be wrong now rather than merely wasteful: every
+ * key of a Mechvibes pack names the SAME path and differs only in the slice.
+ */
 
 /* code -> sample id, or -1. KEY_CNT entries of int16_t is 1.5KB, which buys
  * an O(1) lookup in the drain path and removes the question of how many keys
@@ -1285,18 +1488,22 @@ static int bindings_plan(const evclack_config_t *cfg, int16_t *key_sample,
         int id = -1;
         for (int j = 0; j < *n_refs; j++)
             if (strcmp(refs[j].path, b->sample) == 0 &&
-                refs[j].gain == b->gain) { id = j; break; }
+                refs[j].gain     == b->gain     &&
+                refs[j].start_ms == b->start_ms &&
+                refs[j].end_ms   == b->end_ms) { id = j; break; }
         if (id < 0) {
             if (*n_refs >= AUDIO_NSAMPLES) {
                 LOG_ERR("more than %d distinct samples; bindings that share "
-                        "a file AND a gain share a sample, so give some of "
-                        "them the same gain or use fewer files",
+                        "a file, a gain AND a slice share a sample, so give "
+                        "some of them the same gain or use fewer sounds",
                         AUDIO_NSAMPLES);
                 return -1;
             }
             id = (*n_refs)++;
-            refs[id].path = b->sample;
-            refs[id].gain = b->gain;
+            refs[id].path     = b->sample;
+            refs[id].gain     = b->gain;
+            refs[id].start_ms = b->start_ms;
+            refs[id].end_ms   = b->end_ms;
         }
         key_sample[b->key] = (int16_t)id;
     }
@@ -1324,7 +1531,9 @@ static int refs_same_set(const sample_ref_t *old, int n_old,
             if (used[j]) continue;
             if (old[j].path && nw[i].path &&
                 strcmp(old[j].path, nw[i].path) == 0 &&
-                old[j].gain == nw[i].gain) { found = j; break; }
+                old[j].gain     == nw[i].gain     &&
+                old[j].start_ms == nw[i].start_ms &&
+                old[j].end_ms   == nw[i].end_ms) { found = j; break; }
         }
         if (found < 0) return 0;
         used[found] = 1;
@@ -1887,16 +2096,16 @@ static void config_reload(dev_list_t *devs, evclack_config_t *cfg,
      * costs its own keys and nothing else - not the stream, not the reload.
      * This is also the slow part: SRC_SINC_BEST_QUALITY runs here, on the
      * epoll thread, at SCHED_FIFO, so keypresses landing during it are lost.
-     * Bounded, user-triggered, and the price of not decoding in RT. */
+     * Bounded, user-triggered, and the price of not decoding in RT.
+     *
+     * An imported soundpack makes that window much larger than a
+     * hand-written config's - a hundred slices instead of one or two - which
+     * is what audio_load_refs's decode cache exists to bound: the file is
+     * decoded once and only the sliced audio is resampled. */
     audio_sample_t newset[AUDIO_NSAMPLES];
     memset(newset, 0, sizeof(newset));
-    if (p.action == RELOAD_SAMPLES || p.action == RELOAD_AUDIO_ON) {
-        for (int i = 0; i < p.n_refs; i++)
-            if (audio_load_into(&newset[i], p.refs[i].path,
-                                p.refs[i].gain) != 0)
-                LOG_WARN("hitsound load failed (%s); the keys bound to it "
-                         "stay silent", p.refs[i].path);
-    }
+    if (p.action == RELOAD_SAMPLES || p.action == RELOAD_AUDIO_ON)
+        audio_load_refs(newset, p.refs, p.n_refs);
 
     switch (p.action) {
     case RELOAD_AUDIO_OFF:
@@ -2250,9 +2459,16 @@ main(int argc, char **argv) {
     LOG_INFO("Config: %s, %zu key(s) on %d sample(s), audio=%s",
              devdesc, cfg.n_bind, g_n_refs,
              cfg.audio_enabled ? "enabled" : "disabled");
-    for (size_t i = 0; i < cfg.n_bind; i++)
-        LOG_INFO("  %-14s -> %s @ %.2f", key_name_or(cfg.bind[i].key),
-                 cfg.bind[i].sample, (double)cfg.bind[i].gain);
+    for (size_t i = 0; i < cfg.n_bind; i++) {
+        const binding_t *b = &cfg.bind[i];
+        if (b->start_ms > 0.0 || b->end_ms > 0.0)
+            LOG_INFO("  %-14s -> %s [%.1f-%.1f ms] @ %.2f",
+                     key_name_or(b->key), b->sample, b->start_ms, b->end_ms,
+                     (double)b->gain);
+        else
+            LOG_INFO("  %-14s -> %s @ %.2f", key_name_or(b->key), b->sample,
+                     (double)b->gain);
+    }
 
 	/* use rt scheduler if we can */
     struct sched_param sp = { .sched_priority = 90 };
@@ -2268,11 +2484,7 @@ main(int argc, char **argv) {
      * id unmapped, and audio_trigger treats that as nothing to play - so
      * those keys go silent and the rest still sound. */
     if (cfg.audio_enabled) {
-        for (int i = 0; i < g_n_refs; i++)
-            if (audio_load(i, g_refs[i].path, g_refs[i].gain) != 0)
-                LOG_WARN("hitsound load failed (%s); the keys bound to it "
-                         "stay silent", g_refs[i].path);
-
+        audio_load_refs(audio.sample, g_refs, g_n_refs);
         audio_start(cfg.audio_latency);
     } else {
         /* Worth saying out loud. In the daemon this grew out of, disabling

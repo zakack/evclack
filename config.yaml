@@ -53,15 +53,22 @@
 # common case - a handful of keys, one sound - is just a list of names. The
 # two blocks may appear in either order.
 #
-# Bindings that name the same file AND the same gain share one loaded
-# sample, so pointing ten keys at one hitsound decodes it once. That is the
-# only real ceiling here: 160 DISTINCT (file, gain) pairs. The number of
+# Bindings that name the same file, the same gain AND the same slice share
+# one loaded sample, so pointing ten keys at one hitsound decodes it once.
+# That is the only real ceiling here: 160 DISTINCT sounds. The number of
 # bound KEYS is not limited.
+#
+# `start` and `end` are optional, in milliseconds, and select a window of
+# the sample file rather than the whole of it. Leave both out for the
+# ordinary case. They exist because an imported soundpack is usually ONE
+# long recording with a window per key, but nothing stops you using them by
+# hand to lift a click out of a longer recording.
 keys:
   - KEY_Z
   - KEY_X
   # - {key: KEY_C, sample: /usr/share/evclack/clack.wav}
   # - {key: KEY_V, gain: 0.6}
+  # - {key: KEY_B, sample: /path/to/recording.ogg, start: 12946, end: 13137}
 
 # The sound.
 #
