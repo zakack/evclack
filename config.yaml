@@ -61,8 +61,9 @@
 # `start` and `end` are optional, in milliseconds, and select a window of
 # the sample file rather than the whole of it. Leave both out for the
 # ordinary case. They exist because an imported soundpack is usually ONE
-# long recording with a window per key, but nothing stops you using them by
-# hand to lift a click out of a longer recording.
+# long recording with a window per key - see "Soundpacks" at the bottom of
+# this file - but nothing stops you using them by hand to lift a click out
+# of a longer recording.
 keys:
   - KEY_Z
   - KEY_X
@@ -110,3 +111,31 @@ audio:
   # sample: /usr/share/evclack/click.wav
   gain: 1.0
   latency: 256
+
+# Soundpacks and skins
+# --------------------
+#
+# `evclack-import` turns a Mechvibes soundpack or an osu! skin into a whole
+# config like this one:
+#
+#     evclack-import ~/packs/cherrymx-blue -o ~/.config/evclack/config.yaml
+#
+# It writes to stdout by default, so you can look before you commit; writing
+# it here reloads the running daemon on save. Archives (.osk, and the .zip a
+# soundpack downloads as) need unpacking first - it will tell you the
+# command. What comes out is an ordinary config: every key names its own
+# file and window, so retuning or unbinding one key is editing one line.
+#
+# For an osu! skin, `-p` picks what to bind. The default reads the skin's
+# key-press/key-confirm/key-delete/key-movement sounds - the set osu! itself
+# uses for typing into chat, which is exactly this job - and falls back to
+# its hitsounds when a skin does not ship them. `-p hitsounds` or `-p menu`
+# force the other two.
+#
+# The one thing worth knowing: auto-discovery opens a keyboard only if it
+# reports EVERY bound key, and a pack defines around a hundred. `-k main`
+# (the default) sticks to keys any keyboard driver claims; `-k full` adds
+# F13-F24, media and international keys, and any single one your board does
+# not have will disqualify it. If the daemon goes silent after an import,
+# look for a `Not listening to ...` warning in the log - it names the board
+# and the key it cannot report, and deleting that key's line is the fix.

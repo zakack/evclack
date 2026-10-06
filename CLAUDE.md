@@ -23,8 +23,10 @@ slot layer and the analog/hidraw front end did not. The history explains a
 lot of the mixer's shape — most of its invariants were MEASURED against a
 300 BPM alternating stream, which is why they read as absolutes.
 
-The entire implementation lives in `evclack.c` (~1700 lines) — there is no
-multi-module structure.
+The entire implementation lives in `evclack.c` (~2400 lines) — there is no
+multi-module structure. `tools/evclack-import.c` is a SEPARATE, installed
+program that turns a Mechvibes soundpack or an osu! skin into a config; it
+does not `#include evclack.c` and shares no code with it.
 
 ## Build
 
@@ -33,7 +35,8 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Produces `build/evclack`. Requires pkg-config-visible dev packages for
+Produces `build/evclack` and `build/evclack-import`. Requires
+pkg-config-visible dev packages for
 `libpipewire-0.3`, `libevdev`, `yaml-0.1` (libyaml), `samplerate`
 (libsamplerate — the mixer conforms every sample to one rate at load time;
 PipeWire's own resampler is not linkable from here), and `sndfile`
@@ -78,6 +81,18 @@ A binding may also carry `start`/`end`, a window in milliseconds selecting
 part of the sample file rather than all of it. Both omitted (the ordinary
 case) means the whole file.
 
+`evclack-import DIR` turns an unpacked Mechvibes soundpack or osu! skin into
+a whole config on stdout (`-o` to write it, `-f` to overwrite). Writing it to
+`~/.config/evclack/config.yaml` reloads the running daemon. It is a separate
+binary ON PURPOSE: the daemon carries no JSON parser, no `.ini` parser and no
+archive layout knowledge, and what the user gets is an ordinary config they
+can read and hand-edit rather than an opaque `soundpack:` line. See its own
+header comment for the format details — where the two Mechvibes generations
+disagree, why the iohook table is written longhand, and why osu!'s
+`key-press-*` family is the right default. It links libevdev/libyaml/sndfile
+and neither PipeWire nor libsamplerate; it opens sound files read-only and
+never writes audio.
+
 `tools/mixtest.c` is a unit test that `#include`s `evclack.c` outright, so it
 exercises the daemon's real mixer rather than a copy that could drift; keep
 it that way. It needs no PipeWire and no stubs: `audio_mix` is the whole
@@ -93,6 +108,17 @@ puts at frame 0 — they predate placement and are the regression gate on the
 mixer proper, so they must keep testing the mixer and not the clock. It
 cannot see a memory-ordering bug — it is single-threaded by construction — so
 a `-fsanitize=thread` run of the daemon is still the check for that.
+
+`tools/evclack-import.c` has no test of its own; it is checked against real
+packs. The fixtures that matter are a genuine Mechvibes-DX pack (99 keys, one
+55-second ogg — this is also the load-time check on the decode cache), a
+classic v1 `single` pack (which uses `[start, LENGTH]`, NOT `[start, end]`),
+a v2 `multi` pack with a `{0-4}` range and `-up` release keys, an osu! skin
+with a `key-press-*` family, and one with hitsounds only and a zero-frame
+placeholder. Every generated config should then be fed to the real daemon:
+`./build/evclack -c GENERATED -i EMPTY_DIR` parses it, plans it and loads
+every sample without opening a device, which is the whole of the import
+contract in one command.
 
 `tools/maptest.c` is the same trick over the key → sample layer, which is
 the only part of this program that is not inherited: it writes a temp YAML,
@@ -254,7 +280,17 @@ reverse order.
   carrying a subset would be opened for keys it cannot report. The
   consequence is that adding an exotic binding can silently narrow which
   keyboards are picked up — which is the right trade, but worth saying out
-  loud when a binding is added.
+  loud when a binding is added. SOUNDPACK IMPORT IS WHERE THIS ACTUALLY
+  BITES: a pack defines around a hundred keys whether or not the user owns
+  them, so importing everything a pack offers is the likeliest way to end up
+  with a daemon that opens nothing. `evclack-import` defends against it with
+  `-k main|full` — `main`, the default, is the USB HID boot-protocol range
+  that a keyboard driver claims whether or not the plastic has the key, and
+  `full` adds F13-F24, media, international and other board-specific keys.
+  Measured on a Wooting 60HE+: `-k main` (103 bindings) opens it, `-k full`
+  (157) does not - the board reports the whole numpad and navigation cluster
+  it does not physically have, but not `KEY_NEXTSONG`. That is the boot-
+  protocol claim behind `main` confirmed rather than assumed.
 
 - `load_config` REJECTS A MISSING OR EMPTY `keys` LIST, and this is not
   pedantry. With zero bindings `auto_open_ok`'s "every bound key" test

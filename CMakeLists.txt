@@ -64,6 +64,29 @@ target_link_libraries(evclack PRIVATE
     ${SNDFILE_LIBRARIES}
 )
 
+# The soundpack importer. A shipped program rather than a developer tool, so
+# unlike mixtest/maptest it is installed - and unlike them it does NOT
+# #include evclack.c: it writes a config, it does not run one. That is also
+# why it links three of the daemon's five dependencies and neither PipeWire
+# nor libsamplerate. It opens sound files read-only, to tell an osu! skin's
+# deliberately-silent placeholder from a real sound and to range-check a
+# soundpack's slices; it never decodes or writes audio.
+add_executable(evclack-import tools/evclack-import.c)
+
+target_compile_options(evclack-import PRIVATE
+    -Wall -Wextra
+    ${LIBEVDEV_CFLAGS_OTHER} ${LIBYAML_CFLAGS_OTHER} ${SNDFILE_CFLAGS_OTHER}
+)
+target_include_directories(evclack-import PRIVATE
+    ${LIBEVDEV_INCLUDE_DIRS} ${LIBYAML_INCLUDE_DIRS} ${SNDFILE_INCLUDE_DIRS}
+)
+target_link_directories(evclack-import PRIVATE
+    ${LIBEVDEV_LIBRARY_DIRS} ${LIBYAML_LIBRARY_DIRS} ${SNDFILE_LIBRARY_DIRS}
+)
+target_link_libraries(evclack-import PRIVATE
+    ${LIBEVDEV_LIBRARIES} ${LIBYAML_LIBRARIES} ${SNDFILE_LIBRARIES} m
+)
+
 # Developer tools. Not installed, but deliberately part of the default build:
 # each #includes evclack.c so it exercises the daemon's own code rather than a
 # copy that could drift, and that guarantee is worthless if the binary can go
@@ -101,7 +124,7 @@ endforeach()
 
 configure_file(evclack.service.in evclack.service @ONLY)
 
-install(TARGETS evclack RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS evclack evclack-import RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES   config.yaml             DESTINATION ${CMAKE_INSTALL_DATADIR}/evclack)
 install(FILES   click.wav               DESTINATION ${CMAKE_INSTALL_DATADIR}/evclack)
 install(FILES   ${CMAKE_CURRENT_BINARY_DIR}/evclack.service
