@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Silence an osu! skin's hitsounds, and nothing else.
+
+    osk-silence SKIN.osk [-o OUT.osk] [--name NAME | --keep-name] [--spinner] [--dry-run]
+
+SKIN may be an .osk/.zip or an unpacked skin folder. The original is never modified; the
+result is a new .osk, by default next to the input with " (silent hitsounds)" appended.
+
+Two things make this harder than deleting files:
+
+  * A hitsound the skin does not ship falls back to lazer's default skin, which is audible.
+    So every hitsound name gets a silent file, not only the ones the skin already has.
+  * Lazer, like stable, looks a sample up as .wav, then .mp3, then .ogg (Skin.RecycleSamples
+    in ppy/osu). A silent .wav therefore wins whatever format the skin used; the other
+    formats of the same name are removed anyway so the archive is not misleading.
+
+The silent file is a 44-byte WAV, 16-bit stereo 44.1 kHz with no sample data, the same
+placeholder that has already been played with in lazer. Combo break, applause, failsound,
+menu and spinner sounds are left alone (--spinner also silences spinnerspin and
+spinnerbonus). Only samples at the skin's top level count, because that is where samples
+are read from.
+"""
+import argparse, io, os, re, struct, sys, zipfile
+
+SETS = ("normal", "soft", "drum")
+HITS = ("hitnormal", "hitclap", "hitwhistle", "hitfinish", "sliderslide", "sliderwhistle", "slidertick")
+SPINNER = ("spinnerspin", "spinnerbonus")
+AUDIO = (".wav", ".mp3", ".ogg")
+
+SILENT_WAV = (b"RIFF" + struct.pack("<I", 36) + b"WAVE"
+              + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16)
+              + b"data" + struct.pack("<I", 0))
+assert len(SILENT_WAV) == 44
+
+
+def targets(spinner):
+    names = {f"{s}-{h}" for s in SETS for h in HITS}
+    if spinner:
+        names |= set(SPINNER)
+    return names
+
+
+def read_skin(path):
+    """[(archive name, bytes)] in original order, from an .osk/.zip or a folder."""
+    if os.path.isdir(path):
+        out = []
+        for root, _, files in os.walk(path):
+            for f in sorted(files):
+                full = os.path.join(root, f)
+                out.append((os.path.relpath(full, path).replace(os.sep, "/"), open(full, "rb").read()))
+        return out
+    with zipfile.ZipFile(path) as z:
+        return [(i.filename, z.read(i)) for i in z.infolist() if not i.is_dir()]
+
+
+def sample_name(entry):
+    """The hitsound name an archive entry provides, or None: top level, an audio extension."""
+    if "/" in entry.strip("/"):
+        return None
+    stem, ext = os.path.splitext(entry)
+    return stem.lower() if ext.lower() in AUDIO else None
+
+
+def rename(ini, name, keep):
+    """Set or extend the skin's Name in skin.ini, preserving everything else byte for byte."""
+    if keep:
+        return ini
+    # Every Name in every [General] section. Lazer applies them in order, so the last one
+    # wins, and skins that have been through lazer's exporter can carry two [General]
+    # sections; renaming only the first leaves the old name showing.
+    text = ini.decode("utf-8-sig", errors="replace")
+    bom = ini.startswith(b"\xef\xbb\xbf")
+    line = re.compile(r"^(\s*Name\s*:\s*)(.*?)(\s*)$")
+    section, out, changed = None, [], False
+    for raw in text.splitlines(keepends=True):
+        body = raw.rstrip("\r\n")
+        ending = raw[len(body):]
+        header = re.match(r"^\s*\[(.+?)\]\s*$", body)
+        if header:
+            section = header.group(1).strip().lower()
+        elif section == "general" and (m := line.match(body)):
+            old = m.group(2)
+            new = name if name else (old if old.endswith(" (silent hitsounds)") else f"{old} (silent hitsounds)")
+            body = m.group(1) + new + m.group(3)
+            changed = True
+        out.append(body + ending)
+    if not changed:
+        return ini
+    return (b"\xef\xbb\xbf" if bom else b"") + "".join(out).encode("utf-8")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Silence an osu! skin's hitsounds, and nothing else.")
+    ap.add_argument("skin", help="an .osk/.zip or an unpacked skin folder")
+    ap.add_argument("-o", "--output", help="output .osk (default: next to the input)")
+    ap.add_argument("--name", help="skin name to write into skin.ini")
+    ap.add_argument("--keep-name", action="store_true", help="leave skin.ini's Name alone")
+    ap.add_argument("--spinner", action="store_true", help="also silence spinnerspin and spinnerbonus")
+    ap.add_argument("--dry-run", action="store_true", help="report what would change and write nothing")
+    ap.add_argument("--force", action="store_true", help="overwrite the output if it exists")
+    a = ap.parse_args()
+
+    src = a.skin.rstrip("/")
+    if not os.path.exists(src):
+        sys.exit(f"osk-silence: no such skin: {src}")
+    stem = os.path.splitext(os.path.basename(src))[0] if os.path.isfile(src) else os.path.basename(src)
+    out = a.output or os.path.join(os.path.dirname(os.path.abspath(src)), f"{stem} (silent hitsounds).osk")
+    if os.path.abspath(out) == os.path.abspath(src):
+        sys.exit("osk-silence: refusing to overwrite the input")
+    if os.path.exists(out) and not (a.force or a.dry_run):
+        sys.exit(f"osk-silence: {out} exists (use --force to overwrite)")
+
+    want = targets(a.spinner)
+    entries = read_skin(src)
+
+    kept, replaced = [], {}
+    for entry, data in entries:
+        name = sample_name(entry)
+        if name in want:
+            replaced.setdefault(name, []).append(entry)
+            continue
+        if entry.lower() == "skin.ini":
+            data = rename(data, a.name, a.keep_name)
+        kept.append((entry, data))
+
+    added = sorted(want - set(replaced))
+    for name in sorted(want):
+        kept.append((f"{name}.wav", SILENT_WAV))
+
+    print(f"{stem}: {len(want)} hitsounds silenced")
+    print(f"  replaced {len(replaced)} the skin had: " + (", ".join(
+        f"{n} ({'/'.join(sorted(os.path.splitext(e)[1].lower() for e in es))})" for n, es in sorted(replaced.items())) or "none"))
+    print(f"  added {len(added)} it was missing, which lazer would otherwise take from its default skin")
+    print(f"  {len(kept) - len(want)} other files untouched")
+
+    if a.dry_run:
+        print("dry run: nothing written")
+        return 0
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for entry, data in kept:
+            z.writestr(entry, data)
+    with open(out, "wb") as f:
+        f.write(buf.getvalue())
+    print(f"written: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
