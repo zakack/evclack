@@ -325,22 +325,50 @@ reverse order.
 
 ## Key invariants to preserve in the config-reload path
 
-- FREEING A SAMPLE BUFFER REQUIRES THE STREAM TEARDOWN, and there is no lock
-  that substitutes. `mix_voice_t.samples` BORROWS `audio.sample[i].samples`
-  outright, and `on_process` runs with `PW_STREAM_FLAG_RT_PROCESS` — on
-  PipeWire's DATA thread, which `pw_thread_loop_lock` does NOT cover. Freeing
-  a buffer a click is still playing out of is a use-after-free in the RT
-  callback. `audio_swap_samples` therefore runs `audio_stream_close()` FIRST:
-  after the node is destroyed no callback exists, which is the same guarantee
-  `audio_restart` already leans on when it memsets the voice pool. Verified
-  under `-fsanitize=address` and `-fsanitize=thread`: 56 reloads that each
-  free and re-decode the set, against a synthetic board at 124 presses/sec
-  into a 259ms sample (~32 voices live throughout), reported nothing.
+- A RELOAD NEVER TAKES THE NODE OFF THE GRAPH. Not for samples, not for
+  latency. PipeWire re-picks the quantum whenever the graph changes, and in
+  the moment our node is gone it picks without our `node.latency` — the
+  `clock.quantum` default, typically 1024. Every `pipewire-jack` client sets
+  `node.lock-quantum = true` by default and sets no latency of its own, so a
+  JACK client on the graph (osu!, a DAW) then PINS that 1024 and refuses the
+  rebuilt node's request until the client exits. Observed live: a sample
+  edit mid-game left the session at 1024 until osu! (as a JACK client)
+  closed, and the same edit on the live-node path left it untouched. A
+  stand-in JACK client did NOT reproduce the jump on the bench, so how the
+  quantum got past the lock in that window is unexplained — but it needs our
+  node gone to happen at all, which is what this rule removes. For a rhythm-game companion a latency change the user
+  did not ask for is a serious bug, not a cosmetic one. Latency therefore
+  changes through `pw_stream_update_properties` on the live node
+  (`audio_relatency`), and samples swap under the data loop's lock (below).
+  The destroy-and-rebuild path still exists for a stream that actually DIED
+  (`audio_restart`), where there is no node left to keep.
+
+- FREEING A SAMPLE BUFFER REQUIRES EXCLUDING `on_process`, and
+  `pw_thread_loop_lock` DOES NOT. `mix_voice_t.samples` BORROWS
+  `audio.sample[i].samples` outright, and `on_process` runs with
+  `PW_STREAM_FLAG_RT_PROCESS` — on PipeWire's DATA thread, which the thread
+  loop's lock does not cover. Freeing a buffer a click is still playing out
+  of is a use-after-free in the RT callback. The DATA LOOP's own lock does
+  cover it: the loop holds that mutex for the whole of every dispatch and
+  drops it only while sleeping in poll, so `pw_loop_locked(
+  pw_stream_get_data_loop(...))` runs a function with no process cycle in
+  flight — the same primitive `pw_stream` uses internally to swap its own RT
+  callbacks. `swap_locked` does only pointer moves, a voice-pool memset and a
+  ring drain under it (the RT thread is waiting); the frees happen after.
+  The ring drain is not the rebuild's reason — pending entries carry OLD
+  sample ids that would index the new set and play the wrong sound. Verified
+  under `-fsanitize=address` and `-fsanitize=thread`: 56 swaps against a live
+  stream with ~32 voices in flight (124 triggers/sec into 259ms samples), node
+  id unchanged throughout, nothing reported — and the same harness with
+  `pw_loop_locked` replaced by a direct call is flagged by TSan at once
+  (`free` racing a read on the data thread, which holds the loop mutex).
 
 - `audio_stream_reopen` IS THE ONE PLACE THE RESTART FLAG IS CLEARED. It was
-  split out of `audio_restart` so the reload path reuses it rather than
-  copying its tail — the flag-after-teardown rule it carries is the one
-  documented cause of an infinite rebuild loop, and it must not exist twice.
+  split out of `audio_restart` so a second caller reuses it rather than
+  copying its tail (a reload reaches it only through `audio_swap_samples`'s
+  fallback for a stream with no data loop) — the flag-after-teardown rule it
+  carries is the one documented cause of an infinite rebuild loop, and it
+  must not exist twice.
   Every caller runs `audio_stream_close()` immediately before it.
 
 - VALIDATE INTO SCRATCH, COMMIT ONLY ON SUCCESS. `config_validate` parses and

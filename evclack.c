@@ -917,7 +917,7 @@ static void audio_cleanup(void);
  * rate we are about to renegotiate. */
 /* The second half of every rebuild: bring the node back up around whatever
  * audio.sample[] and audio.latency now hold. Split out of audio_restart so
- * the config-reload path reuses it verbatim rather than copying its tail -
+ * any other caller reuses it verbatim rather than copying its tail -
  * the "clear the flag after the teardown" rule below is the one thing in
  * this file that causes an INFINITE rebuild loop when got wrong, and it is
  * worth a great deal that it exists in exactly one place.
@@ -965,15 +965,86 @@ static void audio_restart(void) {
     audio_stream_reopen();
 }
 
-/* Replace the whole loaded sample set. THE reason a config reload is not
- * just "re-read the file": mix_voice_t.samples borrows audio.sample[i]
- * outright, and on_process runs with PW_STREAM_FLAG_RT_PROCESS - on
- * PipeWire's DATA thread, which pw_thread_loop_lock does not cover. There is
- * no lock that makes freeing one of these buffers safe against a click that
- * is still playing out of it. The stream teardown is the synchronisation:
- * after audio_stream_close() the node is destroyed and no callback exists,
- * which is the same guarantee audio_restart already leans on when it memsets
- * the voice pool.
+/* Change the requested quantum on the live node. node.latency is a node
+ * property PipeWire re-reads on update and re-plans the graph around, so
+ * this costs no rebuild - and must not cost one, for the reason
+ * audio_swap_samples gives: a node that leaves the graph, even briefly, can
+ * hand the session a quantum it cannot get back while a JACK client holds
+ * the lock. If that same lock is held NOW, the new request is simply not
+ * honoured until it is released, which is the lock doing its job.
+ *
+ * Silent no-op when the value is unchanged, so audio_swap_samples can call
+ * it unconditionally. */
+static void audio_relatency(unsigned latency) {
+    if (!audio_available) return;
+    latency = latency ? latency : AUDIO_LATENCY_DEFAULT;
+    if (latency == audio.latency) return;
+    audio.latency = latency;   /* also what the next rebuild requests */
+    if (!audio.stream) return;
+
+    char lat[32];
+    snprintf(lat, sizeof(lat), "%u/%d", audio.latency, MIX_RATE);
+    struct spa_dict_item it[] = { SPA_DICT_ITEM_INIT(PW_KEY_NODE_LATENCY, lat) };
+
+    pw_thread_loop_lock(audio.loop);
+    pw_stream_update_properties(audio.stream, &SPA_DICT_INIT_ARRAY(it));
+    pw_thread_loop_unlock(audio.loop);
+}
+
+/* The part of a sample swap that must not overlap a process cycle. Runs
+ * under the stream's DATA LOOP lock (pw_loop_locked), which that loop holds
+ * for the whole of every dispatch and drops only while it sleeps in poll -
+ * so on_process is not running and cannot start until this returns. Kept to
+ * pointer moves and a memset: the RT thread is waiting on it.
+ *
+ * The ring is drained here for a different reason than a rebuild drains it.
+ * Pending entries are sample ids from the OLD numbering, and after this
+ * returns they would index the new set and play the wrong sound. Writing
+ * tail is the consumer's job, and with the consumer excluded this is it. */
+typedef struct {
+    audio_sample_t *newset;
+    int             n_new;
+    float          *old[AUDIO_NSAMPLES];
+} swap_args_t;
+
+static int swap_locked(struct spa_loop *loop, bool async, uint32_t seq,
+                       const void *data, size_t size, void *user_data) {
+    (void)loop; (void)async; (void)seq; (void)data; (void)size;
+    swap_args_t *a = user_data;
+
+    for (int i = 0; i < AUDIO_NSAMPLES; i++) {
+        a->old[i] = audio.sample[i].samples;
+        if (i < a->n_new) {
+            audio.sample[i]      = a->newset[i];
+            a->newset[i].samples = NULL;
+        } else {
+            audio.sample[i] = (audio_sample_t){ 0 };
+        }
+    }
+    memset(audio.voice, 0, sizeof(audio.voice));
+    atomic_store(&trig.tail, atomic_load(&trig.head));
+    return 0;
+}
+
+/* Replace the whole loaded sample set ON THE LIVE NODE. mix_voice_t.samples
+ * borrows audio.sample[i] outright and on_process runs with
+ * PW_STREAM_FLAG_RT_PROCESS - on PipeWire's DATA thread, which
+ * pw_thread_loop_lock does not cover - so a buffer may only be freed once no
+ * process cycle can be reading it. swap_locked gives that guarantee by
+ * running under the data loop's own lock; after it returns no voice points
+ * at an old buffer, and the frees below race nothing.
+ *
+ * THE NODE IS NOT TORN DOWN, and that is the point. This used to destroy
+ * and rebuild the stream, and the moment the graph spends without our node
+ * is enough to lose the session's quantum: PipeWire re-picks it without our
+ * node.latency (clock.quantum, typically 1024), and a JACK client - osu!,
+ * a DAW, anything through pipewire-jack, which sets node.lock-quantum by
+ * default - then pins the graph there, so the rebuilt node's request is
+ * refused until that client exits. Seen live with osu! as a JACK client:
+ * a sample edit mid-game left the graph at 1024 until the game closed. A
+ * node that never leaves cannot cause that.
+ *
+ * Voices in flight are cut, which is what the rebuild did too.
  *
  * Takes ownership of the buffers in `newset` and nulls what it took, so a
  * caller can free the remainder unconditionally. */
@@ -981,33 +1052,29 @@ static int audio_swap_samples(audio_sample_t *newset, int n_new,
                               unsigned latency) {
     if (!audio_available) return -1;
 
-    audio_stream_close();
+    swap_args_t a = { .newset = newset,
+                      .n_new  = n_new < AUDIO_NSAMPLES ? n_new
+                                                       : AUDIO_NSAMPLES };
 
-    for (int i = 0; i < AUDIO_NSAMPLES; i++) {
-        free(audio.sample[i].samples);
-        audio.sample[i].samples    = NULL;
-        audio.sample[i].num_frames = 0;
-        audio.sample[i].gain       = 0.0f;
+    /* The stream gets its data loop at connect, which audio_stream_open
+     * always does, so this is not expected to be NULL. If it ever is, there
+     * is no lock to take, and the teardown is the only other thing that
+     * excludes on_process - so fall back to it, quantum hazard and all,
+     * rather than free under a running callback. */
+    struct pw_loop *dl = audio.stream ? pw_stream_get_data_loop(audio.stream)
+                                      : NULL;
+    if (dl) {
+        pw_loop_locked(dl, swap_locked, 0, NULL, 0, &a);
+    } else {
+        audio_stream_close();
+        swap_locked(NULL, false, 0, NULL, 0, &a);
+        audio_stream_reopen();
     }
-    for (int i = 0; i < n_new && i < AUDIO_NSAMPLES; i++) {
-        audio.sample[i]    = newset[i];
-        newset[i].samples  = NULL;
-    }
-    audio.latency = latency ? latency : AUDIO_LATENCY_DEFAULT;
+    for (int i = 0; i < AUDIO_NSAMPLES; i++)
+        free(a.old[i]);
 
-    audio_stream_reopen();
+    audio_relatency(latency);
     return audio_available ? 0 : -1;
-}
-
-/* Renegotiate the node quantum, keeping every loaded sample. Latency is the
- * one audio setting that costs a stream rebuild but no decoding, and
- * SRC_SINC_BEST_QUALITY is tens of milliseconds per sample on an epoll
- * thread running at SCHED_FIFO - worth not paying for nothing. */
-static void audio_relatency(unsigned latency) {
-    if (!audio_available) return;
-    audio_stream_close();
-    audio.latency = latency ? latency : AUDIO_LATENCY_DEFAULT;
-    audio_stream_reopen();
 }
 
 static void audio_cleanup(void) {
@@ -1545,7 +1612,7 @@ static int refs_same_set(const sample_ref_t *old, int n_old,
 /* What a reload has to do to the audio subsystem, cheapest first. */
 enum {
     RELOAD_NONE = 0,   /* key table only - no seam, nothing rebuilt */
-    RELOAD_LATENCY,    /* rebuild the node, keep every loaded sample */
+    RELOAD_LATENCY,    /* re-request the quantum, keep every loaded sample */
     RELOAD_SAMPLES,    /* re-decode and swap the sample set */
     RELOAD_AUDIO_OFF,  /* audio.enabled went false */
     RELOAD_AUDIO_ON,   /* audio.enabled went true, or startup had failed */
